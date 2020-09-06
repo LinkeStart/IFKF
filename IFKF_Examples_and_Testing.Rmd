@@ -1,0 +1,3214 @@
+---
+title: "IF2 EnKF and IF2 EAKF"
+subtitle: "Algorithms and basic testings"
+author:
+  - name: Linke Li, Felicia M. G. Magpantay
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    code_folding: show
+    df_print: paged
+    collapsed: no
+    highlight: textmate
+    keep_md: yes
+    number_sections: yes
+    smooth_scroll: no
+    theme: cerulean
+    toc: yes
+    toc_float: yes
+bibliography: bib-file.bib
+link-citations: yes
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,          # don't show code
+  warning = FALSE,       # don't show warnings
+  message = FALSE,       # don't show messages (less serious warnings)
+  cache = TRUE,         # set to TRUE to save results from last compilation
+  fig.align = "center"   # center figures
+)
+
+remove(list = ls())
+require(pomp)
+require(tidyverse)
+require(ggplot2)
+require(plotly)
+require(reshape2)
+theme_set(theme_bw())
+source(file.path(getwd(), "Mif2_Kalman_extension.R"))
+library(foreach)
+library(doParallel)
+registerDoParallel()
+library(doRNG)
+
+index.95 <- function(object, coefList, MLE.CI, Np){
+  coefList %>%
+    traces() -> obj.list
+  output.index <- rep(dim(obj.list[[1]])[1],length(obj.list))
+  for(i in 1:length(obj.list)){
+    obj.trace <- obj.list[[i]]
+    #print(paste0("Object:",i))
+    for (j in 1:dim(obj.trace)[1]) {
+      coef(object) <- obj.trace[j,3:dim(obj.trace)[2]]
+      lik <- logLik(pfilter(object,Np = Np))
+      if(lik > MLE.CI){
+        output.index[i] <- j 
+        #print(lik)
+        break
+      }
+    }
+    #print(j)
+  }
+  return(output.index)
+}
+```
+
+# IF2 EnKF \& EAKF algorithm pseudocode
+
+<!-- IF2 EnKF and IF2 EAKF are realized by treating the parameters as the 'Extended hidden state' and letting the ensembles of the parameters do random walk. The ensemble of parameters $\Theta_{0,j}^{F,m}$ and the process states $X_{0,j}^{F,m}$ are adjusted simultaneously by the update step of EnKF $\&$ EAKF, given the observation $y$ at time 1 to N. Keeping applying EnKF $\&$ EAKF to the updated parameters M times will make the parameters converge to the true parameter value of the underlying model. -->
+
+We derive the algorithm of iterated EnKF filtering (IF EnKF) and iterated EAKF filtering (IF EAKF) by reviewing the algorithm of IF2. 
+
+Denote the time invariant parameters that we want to investigate in the HMM  as $\theta$, in IF2 algorithm, the process state of the model is firstly extended by $\theta$. In order to apply PF to this extended process state, we also give $\theta$  a pseudo process model, which is usually a zero mean normal distribution. In that way, the ensembles of $\theta$, which are denoted by $\Theta$, take a random walk as the original process state proceeds. The ensembles of the extended process state are then adjusted by the observations $z_{1:n}$ and the update step of PF until time $t_n$. After that,  $\Theta$ are recycled as starting parameters for the next iteration of PF. When we repeat the procedure of PF, the perturbation scale of the random walk gradually approaches to zero and the $\Theta$ are expected to converge to the ML estimate, $\hat \theta$. As an analogy, the update step of PF can be replaced by the update step of EnKF or EAKF and produce IF EnKF and IF EAKF algorithms (@ionides2015inference)(@king2015statistical)(@ionides2006inference). 
+
+Formulating the description of IF, IF2 EnKF and IF EAKF leads to the Algorithm presented below, where the same part that all three algorithms share is coloured by black, the distinct parts of IF2, IF EnKF and IF EAKF are coloured by violet, brown and teal respectively.
+
+![](pseudo_code5.png){width=700px}
+
+IF2 EnKF, IF2 EAKF are named as $mif.enkf$ and $mif.eakf$ in R respectively, they are adapted from the $enkf$, $eakf$ and $mif2$ algorithm in Prof Aaron's POMP package (@king2015statistical).
+
+$mif.enkf$ and $mif.enkf$ are implemented by R without C++.
+
+# Usage and Arguments
+
+## Usage \& Arguments of $mif.enkf$
+
+Function $mif.enkf$ takes the following arguments:
+
+```{r,eval=FALSE}
+mif.enkf(
+    object = pomp.model,
+    Np=200,
+    Nmif=50,
+    cooling.fraction.50=0.5,
+    tol = 0,
+    h = h.enkf,
+    R = R,
+    cooling.type = "geometric",
+    check.fail = TRUE,
+    rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02)),
+    tolerance = 1e-100
+    )
+```
+
+The arguments $object, Np, Nmif, cooling.fraction.50, tol, cooling.type, rw.sd$ are same to $mif2$. The starting point of the random walk is chosen to be the parameter values embedded in the POMP object.
+
+* $h$ is the measurement model. If the measurement model has the additive normal noise, $h$ should be a linear function following the assumption of EnKF. An example of $h$ is:
+
+```{r enkf,eval=FALSE}
+h.enkf <- function(x){0.8*x["H"]}
+```
+
+* $R$ is a function which specify the variance of the normal measurement noise. 
+
+1. If the measurement noise is fixed, it can be a function like:
+
+```{r,eval=FALSE}
+R <- function(x){9}
+```
+
+2. If the measurement noise is changing with time $t$, we can approximate the variance with the prediction of the hidden state. For example, if the number of infectious patient $H$ has the probability $0.8$ to be observed and the measurement model has a binomial noise, the approximated variance $R$ is:  
+
+```{r,eval=FALSE}
+R <- function(x){(0.8*x["H"]*(1 - 0.8))}
+```
+
+* In computation, if the output of function $R$ is 0, the function $mif.enkf$ may crash due to some numerical issues. In that case, assigning $R$ a small value instead of 0 is a good way to avoid crash. Such small value is the argument  $tolerance$ in the $mif.enkf$ function.
+
+* $check.fail$ decides whether we compute the log likelihood and detect filtering failure for each iteration of $EnKF$. Since the proceeding of $EnKF$ is independent of the likelihood, we can set $check.fail = FALSE$ and speed up the algorithm. 
+
+## Usage \& Arguments of $mif.eakf$
+
+Function $mif.eakf$  takes the following arguments:
+
+```{r,eval=FALSE}
+mif.eakf(
+    object = pomp.model,
+    Np=200,
+    Nmif=50,
+    cooling.fraction.50=0.5,
+    tol = 0,
+    R = R,
+    C = C.eakf,
+    cooling.type = "geometric",
+    check.fail = TRUE,
+    tolerance = 1e-100,
+    rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02))
+    )
+```
+
+The inputs $object, Np, Nmif, cooling.fraction.50, tol, cooling.type, rw.sd$ are same to $mif2$. The starting point of the random walk is chosen to be the parameter values embedded in the POMP object.
+
+* $C$ is the matrix form of the measurement model. The function $h.enkf$ in the section 2.1 is corresponding to the matrix $C.eakf$:
+
+```{r}
+C.eakf <- matrix(c(0, 0, 1), 1, 3, byrow = TRUE)*0.8
+dimX <- ncol(C.eakf)
+dimY <- nrow(C.eakf)
+rownames(C.eakf) <- paste0("reports", seq_len(1))
+colnames(C.eakf) <- statenames <- c("S", "I", "H")
+C.eakf
+```
+
+* $R$ is a function which specify the variance of the normal measurement noise. 
+
+1. If the measurement noise is fixed, it can be a function like:
+
+```{r,eval=FALSE}
+R <- function(x){9}
+```
+
+2. If the measurement noise is changing with time $t$, we can approximate the variance with the prediction of the hidden state. For example, if the number of infectious patient $H$ has the probability $0.8$ to be observed and the measurement model has a binomial noise, the approximated variance $R$ is:  
+
+```{r,eval=FALSE}
+R <- function(x){(0.8*x["H"]*(1 - 0.8))}
+```
+
+* In computation, if the output of function $R$ is 0, the function $mif.eakf$ may crash due to some numerical issues. In that case, assigning $R$ a small value instead of 0 is a good way to avoid crash. Such small value is the argument  $tolerance$ in the $mif.eakf$ function.
+
+* $check.fail$ decides whether we compute the log likelihood and detect filtering failure for each iteration of $EAKF$. Since the proceeding of $EAKF$ is independent of the likelihood, we can set $check.fail = FALSE$ and speed up the algorithm. 
+
+* **Failure of svd decomposition in EAKF**:
+
+1. In $mif.eakf$ algorithm, when we compute the adjustment term $b$, we use the code:
+
+```{r,eval=FALSE}
+b <- svdV$u%*%(sqrt(svdV$d)*svdU$u)%*%
+        (1/sqrt(1+svdU$d)/sqrt(svdV$d)*t(svdV$u))
+```
+
+2. In practice, sqrt(svdV\$d) can be equal to 0 numerically. Dividing other terms by 0 makes EAKF algorithm crash. From my point of view, svdV\$d == 0 may be a indication that the model (or parameter) is inconsistent with the observation data.
+
+3. Increasing the ensemble size may be one unbiased way to reduce the probability of such event happens, but it can not really avoid the crash. 
+
+4. Therefore, when some entry of svdV\$d  == 0, svdV\$d will be assigned to some small value (which is the argument $tolerance$ in $mif.eakf$)  so that the algorithm can continue. However, this operation might bring some bias and cause some other potentional numerical problems.
+
+
+# Testing IF2 EnKF and EAKF by constant matrix
+
+In this section, we will test the performance of IF2, IF2 EnKF and IF2 EAKF on a 3D toy example. 
+
+The 3D toy example has a constant latent process:
+
+$$
+X_n = (\theta_1, \theta_1+\theta_2, \theta_2)
+$$
+
+and a measurement model with normal noise:
+
+$$
+f_{Y_n|X_n(y|x;\theta)} \sim Normal[x,
+\begin{pmatrix}
+100 & 0 & 0\\
+0 & 1 & 0\\
+0 & 0 & 25\\
+\end{pmatrix}]
+$$
+
+The example of simulation is generated by this model with $(\theta_1 = 1, \theta_2 = 1)$
+and $n = 1,2,\dots,100$. 
+ 
+In the performance testing, we will choose 50 different initial guesses of $(\theta_1, \theta_2)$ ranging from $(\theta_1 = -1, \theta_2 = 0)$ to $(\theta_1= 3, \theta_2 = 10)$ with sobol Design, then run the IF2, IF2 EnKF, IF2 EAKF algorithms and observe if the values of $(\theta_1, \theta_2)$ converge to the MLE.
+
+## Code of the toy model
+```{r}
+set.seed(3000614)
+data.frame(t = seq(0, 100, by = 1), y1 = NA, y2 = NA, y3 = NA) %>%
+  pomp(
+    times="t",t0=-1,
+    rprocess=euler(Csnippet("
+                            x1 = th1;
+                            x2 = th1+th2;
+                            x3 = th2;"),delta.t=1),
+    rinit= Csnippet("x1 = th1;
+                     x2 = th1+th2;
+                     x3 = th2;"),
+    rmeasure= Csnippet("y1 = rnorm(x1, r1);
+                        y2 = rnorm(x2, r2);
+                        y3 = rnorm(x3, r3);"),
+    dmeasure= Csnippet("lik = dnorm(y1, x1, r1, give_log) +
+                       dnorm(y2, x2, r2, give_log) +
+                       dnorm(y3, x3, r3, give_log);"),
+    #accumvars="H",
+    partrans=parameter_trans(log=c("r1","r2","r3","th2")),
+    statenames=c("x1","x2","x3"),
+    paramnames=c("th1","th2","r1","r2","r3"),
+    params=c(th1 = 1,th2 = 1,r1 = 10,r2 = 1,r3 = 5)
+  ) %>% simulate(nsim = 1) -> toy.example
+```
+
+## Example of simulation
+
+```{r,echo=FALSE,fig.width=8}
+toyData <- as.data.frame(toy.example)
+toyData <- melt(toyData,id.vars = c("t"))
+ggplot(toyData, aes(x=t, y=value,col = variable)) + 
+  geom_line() +
+  facet_wrap( ~ variable, ncol=3) +
+  theme(legend.position="bottom")
+
+## Log likelihood at the true parameter value:
+MLE.lik <- logmeanexp(replicate(5,logLik(pfilter(toy.example,Np = 10000))))
+MLE.95.lik <- MLE.lik - 
+  0.5*qchisq(df=2,p = 0.95)
+as.data.frame(cbind(MLE.lik,MLE.95.lik))
+```
+
+We approximate the Log likelihood of the MLE with the Log likelihood of the example of simulation at the true parameter value (= -112.2857). 
+
+The $(\theta_1,\theta_2)$ which has log Likelihood > -115.2814	is in the 0.95 confidence interval.
+
+## Search $(\theta_1, \theta_2)$ by IF2
+
+### Diagnostic plot of IF2
+
+```{r}
+library(foreach)
+library(doParallel)
+registerDoParallel()
+library(doRNG)
+
+par.starts <- sobolDesign(lower = c(th1 = -1,th2 = 0,r1 = 10,r2 = 1,r3 = 5),
+                          upper = c(th1 = 3,th2 = 10,r1 = 10,r2 = 1,r3 = 5), 
+                          nseq = 50)
+
+registerDoRNG(3000615)
+
+  foreach(i=1:50,.combine=c) %dopar%
+    {
+      library(pomp)
+      library(tidyverse)
+      
+      coef(toy.example) <- par.starts[i,]
+      toy.example %>%
+        ####* Start of Mif2 *####
+      mif2(
+        Np=500,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        rw.sd=rw.sd(th1=(0.02),th2=(0.02))
+      )
+      ####* End of Mif2 *####
+    } -> Toy.locol.mif
+
+Toy.locol.mif %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+
+### Likelihood at the last filtering iteration
+```{r}
+registerDoRNG(900242057)
+
+foreach(mf=Toy.locol.mif,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.mif;results.mif
+
+bake(file = "toy.if2.0.95index.rds",{
+  index.95(object = toy.example,
+           coefList = Toy.locol.mif, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> toy.if2.0.95index
+}
+) -> toy.if2.0.95index
+mean(toy.if2.0.95index)
+```
+
+All repetitions find out the parameter values in 0.95 CI before $Nmif = 50$.
+
+The average $Nmif$ before the algorithm get a $(\theta_1,\theta_2)$ which falls in the 0.95 CI (> -115.2814) is 2.72.
+
+## Search $(\theta_1, \theta_2)$ by IF2 EnKF
+
+### Diagnostic plot of IF2 EnKF
+
+```{r}
+############ MIF EnKF  ###########
+h.enkf <- function(x){c(x["x1"],x["x2"],x["x3"])}
+R <- function(x){diag(c(100,1,25))}
+
+  foreach(i=1:50,.combine=c) %dopar%
+    {
+      library(pomp)
+      library(tidyverse)
+      
+      coef(toy.example) <- par.starts[i,]
+      toy.example %>%
+        ###* Start of Mif2 EnKF *####
+      mif.enkf(
+        Np=50,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        h = h.enkf,
+        R = R,
+        cooling.type = "geometric",
+        check.fail = TRUE,
+        rw.sd=rw.sd(th1=(0.02),th2=(0.02))
+        # rw.sd=rw.sd(Beta=0.02,rho=0.02,eta=ivp(0.02))
+      )
+      ###* End of Mif2 EnKF *####
+    } -> Toy.locol.enkf
+
+
+Toy.locol.enkf %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+
+### Likelihood at the last filtering iteration of IF2 EnKF
+
+```{r}
+registerDoRNG(900242057)
+
+foreach(mf=Toy.locol.enkf,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.enkf;results.enkf
+
+bake(file = "toy.enkf.0.95index.rds",{
+  index.95(object = toy.example,
+           coefList = Toy.locol.enkf, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> toy.enkf.0.95index
+}
+) -> toy.enkf.0.95index
+mean(toy.enkf.0.95index)
+```
+
+All repetitions find out the parameter values in 0.95 CI before $Nmif = 50$.
+
+The average $Nmif$ before the algorithm get a $(\theta_1,\theta_2)$ which falls in the 0.95 CI $(> -115.2814)$ is 1.98
+
+## Search $(\theta_1, \theta_2)$ by IF2 EAKF
+
+### Diagnostic plot of IF2 EAKF
+
+```{r}
+############ MIF EAKF  ###########
+C <- diag(c(1,1,1))
+dimX <- ncol(C)
+dimY <- nrow(C)
+rownames(C) <- paste0("y", seq_len(dimY))
+colnames(C) <- paste0("x", seq_len(dimX))
+R <- function(x){diag(c(100,1,25))}
+
+registerDoRNG(3000617)
+
+  foreach(i=1:50,.combine=c) %dopar%
+    {
+      library(pomp)
+      library(tidyverse)
+      
+      coef(toy.example) <- par.starts[i,]
+      
+      toy.example %>%
+        ###* Start of Mif2 EAKF *####
+      mif.eakf(
+        Np=50,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        R = R,
+        C = C,
+        cooling.type = "geometric",
+        check.fail = TRUE,
+        tolerance = 1e-100,
+        rw.sd=rw.sd(th1=(0.02),th2=(0.02))
+      )
+      ###* End of Mif2 EAKF *####
+    } -> Toy.locol.eakf
+
+
+Toy.locol.eakf %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+### Likelihood at the last filtering iteration of IF2 EAKF
+
+```{r}
+registerDoRNG(900242057)
+foreach(mf=Toy.locol.eakf,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.eakf;results.eakf
+
+bake(file = "toy.eakf.0.95index.rds",{
+  index.95(object = toy.example,
+           coefList = Toy.locol.eakf, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> toy.eakf.0.95index
+}
+) -> toy.eakf.0.95index
+mean(toy.eakf.0.95index)
+```
+
+All repetitions can find out the parameter values in 0.95 CI before $Nmif = 50$, but the speed of convergence of IF2 EAKF is relatively slow.
+
+The average $Nmif$ before the algorithm get a $(\theta_1,\theta_2)$ which falls in the 0.95 CI (> -115.2814) is 3.5.
+
+<!-- ## Search $(\theta_1, \theta_2)$ by IF2 KF -->
+
+<!-- Here I tried to find the MLE of $(\theta_1, \theta_2)$ by iterating Kalman Filter. Different from EnKF and EAKF where the covariance between measurement and states is approximated by the ensembles at time $t$, in Kalman filter that covariance is equal to: -->
+<!-- $$P^p \times C.e$$  -->
+<!-- $$\text{C.e is the extended measurement matrix and $P^p$ is prediction variance}$$ -->
+<!-- We have to determine that covariance by defining the extended measurement model before we start. -->
+
+<!-- Using the property of our toy model, I defined the extended measurement model to be: -->
+
+<!-- $$ -->
+<!-- C.e = -->
+<!-- \begin{pmatrix} -->
+<!-- 1/2 & 0 & 0 & 1/2 & 0\\ -->
+<!-- 0 & 1/2 & 0 & 1/4&1/4\\ -->
+<!-- 0 & 0 & 1/2 & 0 & 1/2\\ -->
+<!-- \end{pmatrix} -->
+<!-- $$ -->
+
+<!-- With this $C.e$ and IF2 KF, the log likelihood can decrease a little bit, but the MLE may not be found. -->
+
+<!-- ### Diagnostic plot of IF2 KF -->
+
+<!-- ```{r} -->
+<!-- ###########  *Kalman Filter* ############ -->
+<!-- ## Process Model -->
+<!-- A <- diag(c(1,1,1)) -->
+<!-- dimX <- ncol(A) -->
+<!-- rownames(A) <- paste0("x", seq_len(dimX)) -->
+<!-- colnames(A) <- paste0("x", seq_len(dimX)) -->
+<!-- ## Process Noise (Small value close to 0) -->
+<!-- Q <- diag(rep(1e-20,3)) -->
+<!-- dimX <- ncol(Q) -->
+<!-- rownames(Q) <- paste0("x", seq_len(dimX)) -->
+<!-- colnames(Q) <- paste0("x", seq_len(dimX)) -->
+<!-- ## Extended Measurement Model -->
+<!-- C.e <- rbind(c(1/2,0,0,1/2,0), -->
+<!--              c(0,1/2,0,1/4,1/4), -->
+<!--              c(0,0,1/2,0,1/2)) -->
+<!-- dimX <- ncol(C.e) -->
+<!-- dimY <- nrow(C.e) -->
+<!-- rownames(C.e) <- paste0("y", seq_len(dimY)) -->
+<!-- colnames(C.e) <- c(paste0("x", seq_len(3)),  -->
+<!--                    paste0("th", seq_len(2))) -->
+<!-- ## Measurement Noise -->
+<!-- R <- diag(c(100,1,25)) -->
+<!-- dimX <- ncol(R) -->
+<!-- dimY <- nrow(R) -->
+<!-- rownames(R) <- paste0("y", seq_len(dimY)) -->
+<!-- colnames(R) <- paste0("x", seq_len(dimX)) -->
+<!-- ## Mif KF -->
+<!-- registerDoRNG(3000615) -->
+
+<!--   foreach(i=1:50,.combine=c) %dopar% -->
+<!--     { -->
+<!--       library(pomp) -->
+<!--       library(tidyverse) -->
+
+<!--       coef(toy.example) <- par.starts[i,] -->
+
+<!--       toy.example %>% -->
+<!--         ###* Start of Mif2 KF *#### -->
+<!--       mif.kf( -->
+<!--         Nmif=50, -->
+<!--         cooling.fraction.50=0.5, -->
+<!--         tol = 0, -->
+<!--         Q = Q, -->
+<!--         R = R, -->
+<!--         A = A, -->
+<!--         C = C.e, -->
+<!--         cooling.type = "geometric", -->
+<!--         check.fail = TRUE, -->
+<!--         rw.sd=rw.sd(th1=(0.02),th2=(0.02)) -->
+<!--       )  -->
+<!--       ###* End of Mif2 LF *#### -->
+<!--     } -> Toy.locol.kf -->
+
+
+<!-- Toy.locol.kf %>% -->
+<!--   traces() %>% -->
+<!--   melt() %>% -->
+<!--   ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+ -->
+<!--   geom_line()+ -->
+<!--   guides(color=FALSE)+ -->
+<!--   facet_wrap(~variable,scales="free_y")+ -->
+<!--   theme_bw() -->
+<!-- ``` -->
+
+<!-- ### Likelihood at the last filtering iteration of IF2 KF -->
+
+<!-- ```{r} -->
+<!-- registerDoRNG(900242057) -->
+
+<!-- foreach(mf=Toy.locol.kf,.combine=rbind) %dopar% -->
+<!--   { -->
+<!--     library(pomp) -->
+<!--     library(tidyverse) -->
+<!--     evals <- replicate(5, logLik(pfilter(mf,Np=10000))) -->
+<!--     ll <- logmeanexp(evals,se=TRUE) -->
+<!--     mf %>% coef() %>% bind_rows() %>% -->
+<!--       bind_cols(loglik=ll[1],loglik.se=ll[2]) -->
+<!--   } -> results.kf;results.kf -->
+<!-- ``` -->
+
+
+## Comparison of the Likelihood surface
+
+Use the information in section $3.3,3.4$ and $3.5$, we summarize the likelihood and parameter values at the last filtering iteration given by IF2, IF2 EnKF and IF2 EAKF in the plot below. The parameters used in these algorithms are:
+
+| Method        | Np          | Nmif  | Repeats|
+| ------------- |:-----------:| -----:|------:| 
+| IF2           | 500         | 50    |50     |
+| IF2 EnKF      | 50          | 50    |50     |
+| IF2 EAKF      | 50          | 50    |50     |
+
+The Likelihood surface:
+
+```{r,echo=FALSE}
+
+results.mif$method <- "Mif2"
+results.enkf$method <- "EnKF"
+results.eakf$method <-  "EAKF"
+results.mif.summary <- rbind(results.mif,results.enkf,results.eakf)
+results.mif.summary$neg.loglik <- -results.mif.summary$loglik
+results.mif.summary <- na.omit(results.mif.summary)
+require(GGally)
+results2 <- na.omit(results.mif.summary[results.mif.summary$neg.loglik < 200,])
+results2[,c(1,2,9,8)] %>%
+  ggpairs(.,
+          title = "3by3 Matrix, IF2 vs IF2 EnKF vs IF2 EAKF, Start from incorrect theta1 & theta2",
+          mapping = ggplot2::aes(colour=method),
+          diag = list(discrete="barDiag", 
+                      continuous = wrap("densityDiag", alpha=0.5 )),
+          lower = list(continuous = wrap("smooth", alpha = 0.3, size=1))) -> compare.normal
+compare.normal
+```
+
+
+## Comparison of time consumption
+
+In this section, we compare two types of time consumption. 
+
+1. The red bars represent the time consumption of the numer of $Nmif$ we actually run in the experiments.
+
+2. The green bars represent the time consumption of the average $Nmif$ before the algorithms get a $(\theta_1,\theta_2)$, which falls in the 0.95 confidence interval.
+
+```{r,echo=FALSE}
+time.toy <- data.frame(
+  Type = c(rep("Nmif in algorithm ", each=3),rep("Nmif theta in 0.95 CI", each=3)),
+  Method = rep(c("IF2,Np = 500", "IF2 EnKF,Np = 50", "IF2 EAKF,Np = 50"),2),
+  time = c(2.3968,5.1714,3.9892,0.161,0.2484,0.3646),
+  Nmif = c(rep("Nmif = 50", each=3),"Nmif = 3","Nmif = 2","Nmif = 4")
+)
+time.toy$Method <- factor(time.toy$Method,
+    levels = c("IF2,Np = 500", "IF2 EnKF,Np = 50", "IF2 EAKF,Np = 50"),
+    ordered = TRUE)
+ggplot(data=time.toy, aes(x=Method, y=time, fill=Type,label = Nmif)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_label(
+    position = position_dodge(width = 1),
+    vjust = -0.5, size = 5) +
+  theme(legend.position="bottom")+
+  expand_limits(y = 6)
+```
+
+The data used in this plot:
+
+```{r,echo=FALSE}
+time.toy
+```
+
+For the constant matrix, IF2 EnKF, IF2 EAKF and IF2 have similar performance in finding a $(\theta_1,\theta_2)$ in 0.95 CI.
+
+
+## Comparison of the $(\theta_1,\theta_2)$ before and after iterated filtering
+
+Here we compare the distribution of $(\theta_1,\theta_2)$ before and after we applied the algorithms of IF2, IF2 EnKF and IF2 EAKF.
+
+```{r,echo=FALSE,fig.height=7,cache=FALSE}
+sir.init <- par.starts[,c(1,2)]
+sir.init$Type <- "Initial.theta"
+if.end <- results.mif[,c(1,2)]
+if.end$Type <- "End.IF2"
+enkf.end <- results.enkf[,c(1,2)]
+enkf.end$Type <- "End.IF2_EnKF"
+eakf.end <- results.eakf[,c(1,2)]
+eakf.end$Type <- "End.IF2_EAKF"
+# kf.end <- results.kf[,c(1,2)]
+# kf.end$Type <- "End.IF2_KF"
+InitEnd.0 <- rbind(sir.init,
+                 if.end,
+                 #kf.end,
+                 enkf.end,
+                 eakf.end
+                 )
+ggplot(data = InitEnd.0,aes(x = th1,y = th2,colour = Type)) + 
+  geom_point(alpha = .5) -> p1
+# p1
+ggplotly(p1) %>%
+  layout(legend = list(orientation = "h", x = 0.4, y = -0.1))
+```
+
+
+
+
+
+
+
+
+# Testing IF2 EnKF and EAKF by the simple linear model
+
+In this section, we will test the performance of IF2, IF2 EnKF and IF2 EAKF on a 3D simple linear model. 
+
+The 3D toy example has a latent process model with normal noise:
+
+$$
+X_{0} = (10, 100, 85)
+$$
+
+$$
+f_{X_{n+1}|X_n(x_{n+1}|x_n;\theta)} \sim 
+Normal[
+\begin{pmatrix}
+\tau_2 & 0 & 0\\
+-\tau_1 & \tau_2 & 0\\
+-\tau_1 & 0 & \tau_2\\
+\end{pmatrix}
+x_n,
+\begin{pmatrix}
+1 & 0 & 0\\
+0 & 25 & 0\\
+0 & 0 & 100\\
+\end{pmatrix}]
+$$
+
+and a measurement model with normal noise:
+
+$$
+f_{Y_n|X_n(y|x;\theta)} \sim Normal[x,
+\begin{pmatrix}
+100 & 0 & 0\\
+0 & 100 & 0\\
+0 & 0 & 100\\
+\end{pmatrix}]
+$$
+
+The example of simulation is generated by this model with $(\tau_1 = 0.4, \tau_2 = 1.3)$
+and $n = 1,2,\dots,20$. 
+ 
+In the performance testing, we will choose 50 different initial guesses of $(\tau_1, \tau_2)$ ranging from $(\tau_1 = 0, \tau_2 = 1)$ to $(\tau_1= 1, \tau_2 = 2)$ with sobol Design, then run the IF2, IF2 EnKF, IF2 EAKF algorithms and observe if the values of $(\tau_1, \tau_2)$ converge to the MLE.
+
+## Code of the toy model
+```{r}
+set.seed(3000613)
+data.frame(t = seq(0, 20, by = 1), y1 = NA, y2 = NA, y3 = NA) %>%
+  pomp(
+    times="t",t0=-1,
+    rprocess=euler(Csnippet("
+                            x1 = rnorm(tau2*x1,r2);
+                            x2 = rnorm(tau2*x2 - tau1*x1,r3);
+                            x3 = rnorm(tau2*x3 - tau1*x1,r1);"),delta.t=1),
+    rinit= Csnippet("x1 = 10;
+                     x2 = 100;
+                     x3 = 85;"),
+    rmeasure= Csnippet("y1 = rnorm(x1, r1);
+                        y2 = rnorm(x2, r1);
+                        y3 = rnorm(x3, r1);"),
+    dmeasure= Csnippet("lik = dnorm(y1, x1, r1, give_log) +
+                       dnorm(y2, x2, r1, give_log) +
+                       dnorm(y3, x3, r1, give_log);"),
+    #accumvars="H",
+    partrans=parameter_trans(log=c("r1","r2","r3","tau2"),logit = c("tau1")),
+    statenames=c("x1","x2","x3"),
+    paramnames=c("tau1","tau2","r1","r2","r3"),
+    params=c(tau1 = 0.4,tau2 = 1.3,r1 = 10,r2 = 1,r3 = 5)
+  ) %>% simulate(nsim = 1) -> toy.example.2
+```
+
+## Example of simulation 
+
+```{r,echo=FALSE,fig.width=8}
+toyData.2 <- as.data.frame(toy.example.2)
+toyData.2 <- melt(toyData.2,id.vars = c("t"))
+ggplot(toyData.2, aes(x=t, y=value,col = variable)) + 
+  geom_line() +
+  facet_wrap( ~ variable, ncol=3) +
+  theme(legend.position="bottom")
+## Log likelihood at the true parameter value:
+
+MLE.lik <- logmeanexp(replicate(5,logLik(pfilter(toy.example.2,Np = 10000))))
+MLE.95.lik <- MLE.lik - 
+  0.5*qchisq(df=2,p = 0.95)
+as.data.frame(cbind(MLE.lik,MLE.95.lik))
+```
+
+We approximate the Log likelihood of the MLE with the Log likelihood of the example of simulation at the true parameter value (= -68.15803	).
+
+The $(\tau_1,\tau_2)$ which has log Likelihood > -71.15376 is in the 0.95 confidence interval.
+
+## Search $(\tau_1, \tau_2)$ by IF2
+
+### Diagnostic plot of IF2
+
+```{r}
+library(foreach)
+library(doParallel)
+registerDoParallel()
+library(doRNG)
+
+par.starts.2 <- sobolDesign(lower = c(tau1 = 0,tau2 = 1,r1 = 10,r2 = 1,r3 = 5),
+                          upper = c(tau1 = 1,tau2 = 2,r1 = 10,r2 = 1,r3 = 5), 
+                          nseq = 50)
+registerDoRNG(3000625)
+
+  foreach(i=1:50,.combine=c) %dopar%
+    {
+      library(pomp)
+      library(tidyverse)
+      
+      coef(toy.example.2) <- par.starts.2[i,]
+      toy.example.2 %>%
+        ####* Start of Mif2 *####
+      mif2(
+        Np=500,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        rw.sd=rw.sd(tau1=(0.02),tau2=(0.02))
+      )
+      ####* End of Mif2 *####
+    } -> Toy.mif.2
+
+Toy.mif.2 %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+
+### Likelihood at the last filtering iteration
+```{r}
+registerDoRNG(900242054)
+
+foreach(mf=Toy.mif.2,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.mif.2;results.mif.2
+
+bake(file = "toy2.if2.0.95index.rds",{
+  index.95(object = toy.example.2,
+           coefList = Toy.mif.2, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> toy2.if2.0.95index
+}
+) -> toy2.if2.0.95index
+mean(toy2.if2.0.95index)
+```
+
+The convergence speed of $\tau_1$ is relatively slow, the average $Nmif$ before the algorithm get a combination of $(\tau_1,\tau_2)$ which has log likeliood > -71.15376 is 25.24 .
+
+## Search $(\tau_1, \tau_2)$ by IF2 EnKF
+
+### Diagnostic plot of IF2 EnKF
+
+```{r}
+registerDoRNG(900242507)
+############ MIF EnKF  ###########
+h.enkf <- function(x){c(x["x1"],x["x2"],x["x3"])}
+R <- function(x){diag(c(100,100,100))}
+
+  foreach(i=1:50,.combine=c) %dopar%
+    {
+      library(pomp)
+      library(tidyverse)
+      
+      coef(toy.example.2) <- par.starts.2[i,]
+      toy.example.2 %>%
+        ###* Start of Mif2 EnKF *####
+      mif.enkf(
+        Np=50,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        h = h.enkf,
+        R = R,
+        cooling.type = "geometric",
+        check.fail = TRUE,
+        rw.sd=rw.sd(tau1=(0.02),tau2=(0.02))
+      )
+      ###* End of Mif2 EnKF *####
+    } -> Toy.enkf.2
+
+Toy.enkf.2 %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+
+### Likelihood at the last filtering iteration of IF2 EnKF
+
+```{r}
+registerDoRNG(900242507)
+
+foreach(mf=Toy.enkf.2,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.enkf.2;results.enkf.2
+
+bake(file = "toy2.enkf.0.95index.rds",{
+  index.95(object = toy.example.2,
+           coefList = Toy.enkf.2, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> toy2.enkf.0.95index
+}
+) -> toy2.enkf.0.95index
+mean(toy2.enkf.0.95index)
+```
+
+All repetitions find out the parameter values in 0.95 CI before $Nmif = 50$.
+
+The average $Nmif$ before the algorithm get a combination of $(\tau_1,\tau_2)$ which has log likeliood > -71.15376 is 3.04 .
+
+## Search $(\tau_1, \tau_2)$ by IF2 EAKF
+
+### Diagnostic plot of IF2 EAKF
+
+```{r}
+############ MIF EAKF  ###########
+C <- diag(c(1,1,1))
+dimX <- ncol(C)
+dimY <- nrow(C)
+rownames(C) <- paste0("y", seq_len(dimY))
+colnames(C) <- paste0("x", seq_len(dimX))
+R <- function(x){diag(c(100,100,100))}
+
+registerDoRNG(3000659)
+
+  foreach(i=1:50,.combine=c) %dopar%
+    {
+      library(pomp)
+      library(tidyverse)
+      
+      coef(toy.example.2) <- par.starts.2[i,]
+      
+      toy.example.2 %>%
+        ###* Start of Mif2 EAKF *####
+      mif.eakf(
+        Np=50,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        R = R,
+        C = C,
+        cooling.type = "geometric",
+        check.fail = TRUE,
+        tolerance = 1e-100,
+        rw.sd=rw.sd(tau1=(0.02),tau2=(0.02))
+      )
+      ###* End of Mif2 EAKF *####
+    } -> Toy.eakf.2
+
+Toy.eakf.2 %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+### Likelihood at the last filtering iteration of IF2 EAKF
+
+```{r}
+registerDoRNG(900242057)
+
+foreach(mf=Toy.eakf.2,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.eakf.2;results.eakf.2
+
+bake(file = "toy2.eakf.0.95index.rds",{
+  index.95(object = toy.example.2,
+           coefList = Toy.eakf.2, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> toy2.enkf.0.95index
+}
+) -> toy2.eakf.0.95index
+mean(toy2.eakf.0.95index)
+```
+
+All repetitions can find out the parameter values in 0.95 CI before $Nmif = 50$.
+
+The average $Nmif$ before the algorithm get a combination of $(\tau_1,\tau_2)$ which has log likeliood > -71.15376 is 4.86 .
+
+
+## Comparison of the Likelihood surface
+
+Use the information in section $4.3,4.4$ and $4.5$, we summarize the likelihood and parameter values at the last filtering iteration given by IF2, IF2 EnKF and IF2 EAKF in the plot below. The parameters used in these algorithms are:
+
+| Method        | Np          | Nmif  | Repeats|
+| ------------- |:-----------:| -----:|------:| 
+| IF2           | 500         | 50    |50     |
+| IF2 EnKF      | 50          | 50    |50     |
+| IF2 EAKF      | 50          | 50    |50     |
+
+The Likelihood surface:
+
+```{r,echo=FALSE,cache=FALSE}
+results.mif.2$method <- "Mif2"
+results.enkf.2$method <- "EnKF"
+results.eakf.2$method <-  "EAKF"
+results.mif.summary.2 <- rbind(results.mif.2,results.enkf.2,results.eakf.2)
+results.mif.summary.2$neg.loglik <- -results.mif.summary.2$loglik
+results.mif.summary.2 <- na.omit(results.mif.summary.2)
+require(GGally)
+results3 <- na.omit(results.mif.summary.2[results.mif.summary.2$neg.loglik < 80,])
+results.mif.summary.2[,c(1,2,9,8)] %>%
+  ggpairs(.,
+          title = "Linear Model, IF2 vs IF2 EnKF vs IF2 EAKF, Start from incorrect tau1 & tau2",
+          mapping = ggplot2::aes(colour=method),
+          diag = list(discrete="barDiag",
+                      continuous = wrap("densityDiag", alpha=0.5 )),
+          lower = list(continuous = wrap("smooth", alpha = 0.3, size=1))) -> compare.normal.2
+compare.normal.2
+```
+
+
+## Comparison of time consumption
+
+In this section, we compare two types of time consumption. 
+
+1. The red bars represent the time consumption of the numer of $Nmif$ we actually run in the experiments.
+
+2. The green bars represent the time consumption of the average $Nmif$ before the algorithms get a $(\tau_1,\tau_2)$, which falls in the 0.95 confidence interval.
+
+
+
+```{r,echo=FALSE}
+time.toy <- data.frame(
+  Type = c(rep("Nmif in algorithm ", each=3),rep("Nmif tau in 0.95 CI", each=3)),
+  Method = rep(c("IF2,Np = 500", "IF2 EnKF,Np = 50", "IF2 EAKF,Np = 50"),2),
+  time = c(0.6134,1.1502,0.8246,0.3196,0.1096,0.1156),
+  Nmif = c(rep("Nmif = 50", each=3),"Nmif = 25","Nmif = 3","Nmif = 5")
+)
+time.toy$Method <- factor(time.toy$Method,
+    levels = c("IF2,Np = 500", "IF2 EnKF,Np = 50", "IF2 EAKF,Np = 50"),
+    ordered = TRUE)
+ggplot(data=time.toy, aes(x=Method, y=time, fill=Type,label = Nmif)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_label(
+    position = position_dodge(width = 1),
+    vjust = -0.5, size = 5) +
+  theme(legend.position="bottom")+
+  expand_limits(y = 1.3)
+```
+
+The data used in this plot:
+
+```{r,echo=FALSE}
+time.toy
+```
+
+IF2 EnKF and EAKF only need $\frac{1}{3}$ time consumption of IF2 to find out a $(\tau_1,\tau_2)$ in 0.95 CI.
+
+
+## Comparison of the $(\tau_1,\tau_2)$ before and after iterated filtering
+
+Here we compare the distribution of $(\tau_1,\tau_2)$ before and after we applied the algorithms of IF2, IF2 EnKF and IF2 EAKF.
+
+```{r,echo=FALSE,fig.height=7,cache=FALSE}
+toy2.init <- par.starts.2[,c(1,2)]
+toy2.init$Type <- "Initial.tau"
+if.end <- results.mif.2[,c(1,2)]
+if.end$Type <- "End.IF2"
+enkf.end <- results.enkf.2[,c(1,2)]
+enkf.end$Type <- "End.IF2_EnKF"
+eakf.end <- results.eakf.2[,c(1,2)]
+eakf.end$Type <- "End.IF2_EAKF"
+InitEnd.toy2 <- rbind(toy2.init,
+                 if.end,
+                 enkf.end,
+                 eakf.end
+                 )
+
+InitEnd.toy2 %>%
+ggplot(aes(x = tau1,y = tau2,colour = Type)) + 
+  geom_point(alpha = .5) -> p2 
+
+ggplotly(p2) %>%
+   layout(legend = list(orientation = "h", x = 0.4, y = -0.1))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Testing IF2 EnKF and EAKF by SIR model with binomial noise
+
+The SIR model with binomial noise is adapted from the model used in the [Iterated filtering: principles and practice](https://kingaa.github.io/sbied/mif/mif.html) @kingiterated.
+
+The example of simulation is generated by this model with $(\beta = 16, \eta = 0.2)$, other parameter values are fixed in the experiments, which are $\mu_{IR} = 2, \rho = 0.8, N = 100000.$
+
+In the performance testing, we will choose 50 different initial guesses of $(\beta, \eta)$ range from $(\beta = 8, \eta = 0.1)$ to $(\beta = 32, \eta = 0.4)$ with sobol Design, then run IF2, IF2 EnKF, IF2 EAKF algorithms and observe if the value of $(\beta, \eta)$ can converge to the MLE.
+
+## Code of the SIR model with binomial noise
+
+```{r}
+set.seed(3000614)
+sir_step <- Csnippet("
+  S = nearbyint(abs(S));
+  I = nearbyint(abs(I));
+  H = nearbyint(abs(H));
+  double dN_SI = rbinom(S,1-exp(-Beta*I/N*dt));
+  double dN_IR = rbinom(I,1-exp(-mu_IR*dt));
+  S -= dN_SI;
+  I += dN_SI - dN_IR;
+  H += dN_IR;
+")
+data.frame(week = seq(0, 20, by = 1 / 2), reports = NA)  %>%
+  pomp(
+    times="week",t0=0,
+    rprocess=euler(sir_step,delta.t=1/7),
+    rinit= Csnippet("
+                    S = nearbyint(eta*N);
+                    I = 1;
+                    H = 0;
+                    "),
+    rmeasure= Csnippet("
+                       reports = rbinom(nearbyint(H),rho);
+                       "),
+    dmeasure= Csnippet("
+                       lik = dbinom(reports,nearbyint(H),rho,give_log);
+                      "),
+    accumvars="H",
+    partrans=parameter_trans(log=c("Beta","mu_IR"),logit=c("rho","eta")),
+    statenames=c("S","I","H"),
+    paramnames=c("Beta","mu_IR","eta","rho","N"),
+    params= c(Beta=16,mu_IR=2,rho=0.8,eta=0.2,N=100000)
+  ) %>% simulate(nsim = 1) -> SI.simple
+par.starts.eta <- sobolDesign(lower = c(Beta=8,mu_IR=2,rho=0.8,eta=0.1,N=100000),
+                          upper = c(Beta=32,mu_IR=2,rho=0.8,eta=0.4,N=100000), 
+                          nseq = 50)
+```
+
+In binomial model, the measurement noises are changing as time goes on. In the algorithm of IF2 EnKF and IF2 EAKF, we use the following function and the prediction mean of $H$ to estimate the measurement noises.
+
+```{r}
+R <- function(x){abs(0.8*x["H"]*(1 - 0.8))}
+```
+
+## Example of simulation
+
+```{r,echo=FALSE}
+siData <- as.data.frame(SI.simple)
+siData <- melt(siData,id.vars = c("week"))
+ggplot(siData, aes(x=week, y=value,col = variable)) + 
+  geom_line() +
+  facet_wrap( ~ variable, ncol=2, scales = "free") +
+  theme(legend.position="bottom")
+set.seed(3000614)
+## Log likelihood at the true parameter value:
+MLE.lik <- logmeanexp(replicate(5,logLik(pfilter(SI.simple,Np = 10000))))
+MLE.95.lik <- logmeanexp(replicate(5,logLik(pfilter(SI.simple,Np = 10000)))) - 
+  0.5*qchisq(df=2,p = 0.95)
+as.data.frame(cbind(MLE.lik,MLE.95.lik))
+```
+
+We approximate the Log likelihood of the MLE with the Log likelihood of the example of simulation at the true parameter value (= -127.3501).
+
+The $(\beta,\eta)$ which has log Likelihood > -129.9659 is in the 0.95 confidence interval.
+
+## Search $(\beta,\eta)$ by IF2
+
+### Diagnostic plot of IF2
+
+```{r}
+################ MIF2 ###############
+registerDoRNG(3000616)
+
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple) <- par.starts.eta[i,]
+    
+    SI.simple %>%
+    # # ###* Start of Mif2 *####
+    mif2(
+      Np=2000,
+      Nmif=50,
+      cooling.fraction.50=0.5,
+      tol = 0,
+      rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02))
+    )
+    # # ###* End of Mif2 *####
+  } -> SI.bin.locol
+
+
+SI.bin.locol %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+### Likelihood at the last filtering iteration of IF2 
+
+```{r}
+registerDoRNG(900242056)
+foreach(mf=SI.bin.locol,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.mif;results.mif
+bake(file = "sir.if2.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.bin.locol, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir.if2.0.95index
+}
+) -> sir.if2.0.95index
+mean(sir.if2.0.95index)
+```
+
+10 out of 50 the repetitions of IF2 successfully find out the parameter values of $\eta$ and $\beta$ is in the 0.95 CI, but other 40 repetitions fail to find one given $Nmif = 50$.
+
+The average $Nmif$ before the algorithm get a combination of $(\beta,\eta)$ which is 0.95 CI is 42.94 (Here the $Nmif$ value of the repetitions which can not find the parameter combination in 0.95 CI before 50 iterations is counted as 50).
+
+## Search $(\beta,\eta)$ by IF2 EnKF
+
+### Diagnostic plot of IF2 EnKF
+
+```{r}
+
+registerDoRNG(3000616)
+h.enkf <- function(x){0.8*x["H"]}
+R <- function(x){abs(0.8*x["H"]*(1 - 0.8))}
+
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple) <- par.starts.eta[i,]
+    
+    SI.simple %>%
+    ###* Start of Mif2 EnKF *####
+    mif.enkf(
+      #params=params,
+      Np=200,
+      Nmif=50,
+      cooling.fraction.50=0.5,
+      tol = 0,
+      h = h.enkf,
+      R = R,
+      cooling.type = "geometric",
+      check.fail = TRUE,
+      rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02))
+    )
+    ###* End of Mif2 EnKF *####
+  } -> SI.bin.locol
+
+SI.bin.locol %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+### Likelihood at the last filtering iteration of IF2 EnKF
+
+```{r}
+registerDoRNG(900242056)
+
+foreach(mf=SI.bin.locol,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.enkf;results.enkf
+
+bake(file = "sir.enkf.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.bin.locol, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir.enkf.0.95index
+}
+) -> sir.enkf.0.95index
+mean(sir.enkf.0.95index)
+```
+
+All repetitions find out the parameter values in 0.95 CI before $Nmif = 50$.
+
+The average $Nmif$ before the algorithm get a combination of $(\beta,\eta)$ which is in 0.95 CI $(logLik >-129.7141)$ is 8.22 .
+
+## Search $(\beta,\eta)$ by IF2 EAKF
+
+### Diagnostic plot of IF2 EAKF
+
+```{r}
+################EAKF###############
+R <- function(x){abs(0.8*x["H"]*(1 - 0.8))}
+rho <- 0.8
+C <- matrix(c(0, 0, 1), 1, 3, byrow = TRUE)*rho
+dimX <- ncol(C)
+dimY <- nrow(C)
+rownames(C) <- paste0("reports", seq_len(dimY))
+colnames(C) <- statenames <- c("S", "I", "H")
+registerDoRNG(3000606)
+
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple) <- par.starts.eta[i,]
+    
+    SI.simple %>%
+      ###* Start of Mif2 EAKF *####
+    mif.eakf(
+      #params=params,
+      Np=200,
+      Nmif=50,
+      cooling.fraction.50=0.5,
+      tol = 0,
+      R = R,
+      C = C,
+      cooling.type = "geometric",
+      check.fail = TRUE,
+      tolerance = 1e-100,
+      rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02))
+    )
+    ###* End of Mif2 EAKF *####
+  } -> SI.bin.locol
+
+
+SI.bin.locol %>%
+  traces() %>%
+  melt() -> na.remove.data
+is.na(na.remove.data) <- sapply(na.remove.data, is.infinite)
+na.remove.data %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+### Likelihood at the last filtering iteration of IF2 EAKF
+
+```{r}
+registerDoRNG(900242055)
+
+foreach(mf=SI.bin.locol,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    evals <- replicate(5, logLik(pfilter(mf,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.eakf;results.eakf
+
+bake(file = "sir.eakf.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.bin.locol, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir.eakf.0.95index
+}
+) -> sir.eakf.0.95index
+mean(sir.eakf.0.95index)
+```
+
+All repetitions find out the parameter values in 0.95 CI before $Nmif = 50$.
+
+The average $Nmif$ before the algorithm get a combination of $(\beta,\eta)$ which is in 0.95 CI $(log Lik >-129.7141)$ is 8.76
+
+## Comparison of Likelihood surface
+
+Use the information in section $5.3,5.4$ and $5.5$,  we summarize the likelihood and parameter values at the last filtering iteration given by IF2, IF2 EnKF and IF2 EAKF in the plot. The parameters used in these algorithms are:
+
+
+| Method        | Np          | Nmif  | Repeats|
+| ------------- |:-----------:| -----:|------:| 
+| IF2           | 2000        | 50    |50     |
+| IF2 EnKF      | 200         | 50    |50     |
+| IF2 EAKF      | 200         | 50    |50     |
+
+
+To make the plot clear, all the repetitions with the last filtering iteration's parameter not in 0.95 CI are removed.
+
+The Likelihood surface:
+```{r,echo = FALSE}
+require(GGally)
+results.mif$method <- "Mif2"
+results.enkf$method <- "EnKF"
+results.eakf$method <- "EAKF"
+results <- rbind(results.mif,results.enkf,results.eakf)
+results$neg.loglik <- -results$loglik
+results2 <- na.omit(results[results$neg.loglik < 129.7141,])
+results2[,c(1,4,9,8)] %>%
+  ggpairs(.,
+          #lower = list(continuous = wrap("smooth", alpha = 0.3, size=0.1), 
+          #             discrete = "blank", combo="blank"), 
+          title = "SI Binomial, IF2 vs IF2 EnKF vs IF2 EAKF, Start from incorrect eta & beta",
+          mapping = ggplot2::aes(colour=method),
+          diag = list(discrete="barDiag", 
+                      continuous = wrap("densityDiag", alpha=0.5 )),
+          lower = list(continuous = wrap("smooth", alpha = 0.3, size=1))) -> compare.enkf.mif
+compare.enkf.mif
+```
+
+
+
+## Comparison of the Time Consumption
+
+In this section, we compare two types of time consumption.
+
+1. The red bars represent the time consumption of the numer of $Nmif$ we actually run in the experiments.
+
+2. The green bars represent the time consumption of the average $Nmif$ before the algorithms get a $(\beta,\eta)$, which falls in the 0.95 confidence interval.
+
+
+```{r,echo=FALSE}
+time.sir <- data.frame(
+  Type = c(rep("Nmif in algorithm ", each=3),rep("Nmif parameters in 0.95 CI", each=3)),
+  Method = rep(c("IF2,Np = 2000", "IF2 EnKF,Np = 200", "IF2 EAKF,Np = 200"),2),
+  time = c(6.9786,4.6544,2.6828,5.5318,0.7316,0.4852),
+  Nmif = c(rep("Nmif = 50", each=3),"Nmif = 42","Nmif = 8","Nmif = 9")
+)
+time.sir$Method <- factor(time.sir$Method,
+    levels = c("IF2,Np = 2000", "IF2 EnKF,Np = 200", "IF2 EAKF,Np = 200"),ordered = TRUE)
+ggplot(data=time.sir, aes(x=Method, y=time, fill=Type,label = Nmif)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_label(
+    position = position_dodge(width = 1),
+    vjust = -0.5, size = 5) +
+  theme(legend.position="bottom")+
+  expand_limits(y = 8)
+
+```
+
+The data used in this plot:
+
+```{r,echo=FALSE}
+
+time.sir
+```
+
+For the SI model with binomial noise, the performance of IF2 EAKF is the best and IF2 EnKF is close to IF2 EnKF.  To find out $(\beta,\eta)$ in 0.95 CI, the time consumption of IF2 is $8 \sim 10$ times of the Kalman based iterated filtering.
+
+
+## Comparison of the $(\beta,\eta)$ before and after iterated filtering
+
+Here we compare the distribution of $(\beta,\eta)$ before and after we applied the algorithms of IF2, IF2 EnKF and IF2 EAKF. The initial values of $(\beta,\eta)$ which can make IF2 find a  $(\beta,\eta)$  in 0.95 CI after 50 iterations are specified.
+
+```{r,echo=FALSE,fig.height=7,cache=FALSE}
+index.na <- is.na(results.mif$loglik)
+index.mif <- (results.mif$loglik > -129.7141) 
+index.mif[index.na] <- FALSE
+
+sir.init <- par.starts.eta[,c(1,4)]
+sir.init$Type <- "Initial"
+sir.init.mif.work <- par.starts.eta[index.mif,c(1,4)]
+sir.init.mif.work$Type <- "Initial.IF2.logLik>-130"
+if.end <- results.mif[,c(1,4)]
+if.end$Type <- "End.IF2"
+enkf.end <- results.enkf[,c(1,4)]
+enkf.end$Type <- "End.IF2_EnKF"
+eakf.end <- results.eakf[,c(1,4)]
+eakf.end$Type <- "End.IF2_EAKF"
+InitEnd <- rbind(sir.init,
+                 sir.init.mif.work,
+                 if.end,
+                 enkf.end,
+                 eakf.end)
+InitEnd %>%
+ggplot(aes(x = Beta,y = eta,colour = Type)) + 
+  geom_point(alpha = .5) -> p3
+ggplotly(p3) %>%
+  layout(legend = list(orientation = "h", x = 0.6, y = -0.1))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+# Fit data of SIR model with binomial noise by SIR model with normal noise
+
+In this section, we will fit the example of simulation generated by the SIR model which has binomial measurement noise in section 5.2, with the SIR model which has normal measurement noise:
+
+$$
+f_{Reports_n|X_n(Reports|x;\theta)} \sim Normal(x,r^2)
+$$
+
+The standard error of the normal measurement noise $r$ is a fixed value for week 1 to 20.
+
+In the performance testing, we will choose 1000 different initial guesses of $(\beta, \eta,r)$ range from $(\beta = 8, \eta = 0.1,r = 5)$ to $(\beta = 32, \eta = 0.4, r = 20)$ with sobol Design, and run IF2, IF2 EnKF for 50 times, run IF2 EAKF for 1000 times. 
+
+In the algorithms of IF2, IF2 EnKF, IF2 EAKF, we will only **let $(\beta,\eta)$ do random walk and keep $r$ fixed**.
+
+At the end, we can find that the value of $(\beta,\eta)$ which IF2, IF2 EnKF and IF2 EAKF converge to may be independent of the value of $r$.
+
+
+## Code of the SIR model with normal noise
+
+```{r}
+sir_step <- Csnippet("
+  S = nearbyint(abs(S));
+  I = nearbyint(abs(I));
+  H = nearbyint(abs(H));
+  double dN_SI = rbinom(S,1-exp(-Beta*I/N*dt));
+  double dN_IR = rbinom(I,1-exp(-mu_IR*dt));
+  S -= dN_SI;
+  I += dN_SI - dN_IR;
+  H += dN_IR;
+")
+data.frame(week = seq(0, 20, by = 1 / 2), 
+           reports = as.data.frame(SI.simple)$reports)  %>%
+  pomp(
+    times="week",t0=0,
+    rprocess=euler(sir_step,delta.t=1/7),
+    rinit= Csnippet("
+                    S = nearbyint(eta*N);
+                    I = 1;
+                    H = 0;
+                    "),
+    rmeasure= Csnippet("
+                       reports = rbinom(nearbyint(H),rho);
+                       "),
+    dmeasure= Csnippet("
+                        lik = dnorm(reports,nearbyint(H),r,give_log);
+                      "),
+    accumvars="H",
+    partrans=parameter_trans(log=c("Beta","mu_IR","r"),logit=c("eta","rho")),
+    statenames=c("S","I","H"),
+    paramnames=c("Beta","mu_IR","eta","N","r","rho"),
+    params= c(Beta=16,mu_IR=2,rho=0.8,eta=0.2,N=100000,r = 13)
+  ) -> SI.simple.2
+par.starts.sir.2 <- sobolDesign(lower = 
+                                c(Beta=8,mu_IR=2,eta=0.1,rho = 0.8,N=100000,r = 5),
+                                upper = 
+                                c(Beta=32,mu_IR=2,eta=0.4,rho = 0.8,N=100000,r = 20),                                  nseq = 1000)
+
+```
+
+In the SIR model with normal measurement noise, the standard error of the measurement noise is a parameter $r$ embedded in the POMP model. 
+
+To apply the algorithms of IF2 EnKF and IF2 EAKF, we use the following function to retrieve $r$ from the POMP model:
+
+```{r}
+R <- function(x){matrix((x["r"])^2)}
+```
+
+## Example of Simulation generated by Binomial SIR (Same to section 5.2)
+
+```{r,echo=FALSE}
+siData <- as.data.frame(SI.simple)
+siData <- melt(siData,id.vars = c("week"))
+ggplot(siData, aes(x=week, y=value,col = variable)) + 
+  geom_line() +
+  facet_wrap( ~ variable, ncol=2, scales = "free") +
+  theme(legend.position="bottom")
+set.seed(3000614)
+## Log likelihood at the true parameter value:
+MLE.lik <- logmeanexp(replicate(5,logLik(pfilter(SI.simple,Np = 10000))))
+MLE.95.lik <- logmeanexp(replicate(5,logLik(pfilter(SI.simple,Np = 10000)))) - 
+  0.5*qchisq(df=2,p = 0.95)
+as.data.frame(cbind(MLE.lik,MLE.95.lik))
+```
+
+We approximate the Log likelihood of the MLE with the Log likelihood of the example of simulation at the true parameter value (= -127.3501). This Log likelihood is computed by the SIR model with **Binomial noise**.
+
+The $(\beta,\eta)$ which has log Likelihood > -129.9659 is in the 0.95 confidence interval.
+
+## Search $(\beta,\eta)$ by IF2
+
+### Diagnostic plot of IF2
+
+```{r}
+################ MIF2 ###############
+registerDoRNG(3000616)
+rm(SI.bin.locol)
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple.2) <- par.starts.sir.2[i,]
+    
+    SI.simple.2 %>%
+    # # ###* Start of Mif2 *####
+    mif2(
+      Np=2000,
+      Nmif=50,
+      cooling.fraction.50=0.5,
+      tol = 0,
+      rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02))
+    )
+    # # ###* End of Mif2 *####
+  } -> SI.norm
+
+
+SI.norm %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+In the diagnostic plot, the log likelihood is computed by the SI model with normal noise, (i.e. dmeasure = lik = dnorm(reports,nearbyint(H),r,give_log)).
+
+### Likelihood at the last filtering iteration of IF2 
+
+```{r}
+registerDoRNG(900242056)
+SI.simple.binomial <- SI.simple
+foreach(mf=SI.norm,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    coef(SI.simple.binomial) <- coef(mf)
+    evals <- replicate(5, logLik(pfilter(SI.simple.binomial,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.mif;results.mif
+
+bake(file = "sir2.if2.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.norm, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir2.if2.0.95index
+}
+) -> sir2.if2.0.95index
+mean(sir2.if2.0.95index)
+```
+
+We compute the likelihood at the last filtering iteration of IF2 by the SI model with **Binomial noise**. To do that, we ignore the value of $r$ and only plug the value of $(\beta,\eta)$ into the Binomial SIR model. 
+
+As a result, if we choose to run IF2 with the normal SIR model, none of 50 repetitions has $(\beta,\eta)$ falling in the 0.95 CI constructed by the binomial SIR model before 50 iterations.
+
+In the section 6.8, we can find that, in 15 out of 50 repetitions, IF2 can make the $(\beta,\eta)$ converge to $(20.8,0.154)$ instead of $(16,0.2)$. $(\beta = 16,\eta = 0.2)$ is the parameter of Binomial SIR we used to generate the simulation.
+
+
+## Search $(\beta,\eta)$ by IF2 EnKF
+
+### Diagnostic plot of IF2 EnKF
+
+```{r}
+registerDoRNG(3000613)
+h.enkf <- function(x){0.8*x["H"]}
+R <- function(x){matrix((x["r"])^2)}
+
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple.2) <- par.starts.sir.2[i,]
+    
+    SI.simple.2 %>%
+    ###* Start of Mif2 EnKF *####
+    mif.enkf(
+      Np=200,
+      Nmif=50,
+      cooling.fraction.50=0.5,
+      tol = 0,
+      h = h.enkf,
+      R = R,
+      cooling.type = "geometric",
+      check.fail = TRUE,
+      rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02))
+    )
+    ###* End of Mif2 EnKF *####
+  } -> SI.norm
+
+SI.norm %>%
+  traces() %>%
+  melt() -> na.remove.data
+is.na(na.remove.data) <- sapply(na.remove.data, is.infinite)
+na.remove.data %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+In the diagnostic plot, the log likelihood is computed by the SI model with normal noise, (i.e. dmeasure = lik = dnorm(reports,nearbyint(H),r,give_log)).
+
+### Likelihood at the last filtering iteration of IF2 EnKF
+
+```{r}
+registerDoRNG(900242056)
+SI.simple.binomial <- SI.simple
+foreach(mf=SI.norm,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    coef(SI.simple.binomial) <- coef(mf)
+    evals <- replicate(5, logLik(pfilter(SI.simple.binomial,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.enkf;results.enkf
+
+bake(file = "sir2.enkf.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.norm, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir2.enkf.0.95index
+}
+) -> sir2.enkf.0.95index
+mean(sir2.enkf.0.95index)
+```
+
+All the repetitions of IF2 EnKF find out the parameter values of $(\beta,\eta)$ falling in 0.95 CI constructed by the **Binomial** SI model before $Nmif = 50$, no matter what the value of $r$ is.
+
+The average $Nmif$ before the algorithm get a combination of $(\beta,\eta)$ which is in 0.95 CI $(logLik >-129.7141)$ is 7.42. As a comparison, in section 5.4.2 where we use variable standard error, the average of $Nmif$ is 8.22.
+
+## Search $(\beta,\eta)$ by IF2 EAKF
+
+### Diagnostic plot of IF2 EAKF
+
+Due to the **Failure of svd decomposition in EAKF**, if we set the standard error of the measurement noise to be a constant $r$, most of the repetitions crash before the 50th iteration. 
+
+To deal with that problem, I run IF2 EAKF for 1000 times and get 52 no crash repetitions.
+
+```{r}
+################EAKF###############
+registerDoRNG(3000613)
+R <- function(x){matrix((x["r"])^2)}
+rho <- 0.8
+C <- matrix(c(0, 0, 1), 1, 3, byrow = TRUE)*rho
+dimX <- ncol(C)
+dimY <- nrow(C)
+rownames(C) <- paste0("reports", seq_len(dimY))
+colnames(C) <- statenames <- c("S", "I", "H")
+
+foreach(i=1:1000,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple.2) <- par.starts.sir.2[i,]
+    
+    tryCatch({
+      SI.simple.2 %>%
+        ###* Start of Mif2 EAKF *####
+      mif.eakf(
+        Np=200,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        R = R,
+        C = C,
+        cooling.type = "geometric",
+        check.fail = TRUE,
+        tolerance = 1e-200,
+        rw.sd=rw.sd(Beta=0.02,eta = ivp(0.02))
+      )
+    }, error = function(e) {
+      "Null"
+    })
+    ###* End of Mif2 EAKF *####
+  } -> SI.norm
+```
+
+```{r}
+if.error <- unlist(lapply(SI.norm, is.character))
+index <- 1:1000
+inf.omit <- function(y){
+  is.na(y) <- sapply(y, is.infinite)
+  #is.na(y) <- sapply(y, function(x){x< -3000})
+  if(dim(na.omit(y))[1] == 0){
+    return(y[1,])
+  }else{
+    return(na.omit(y))
+  }
+}
+
+SI.norm[-index[if.error]] %>%
+lapply(., traces) %>% 
+ lapply(.,inf.omit) %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)
+  ))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+In the diagnostic plot, the log likelihood is computed by the SI model with normal noise, (i.e. dmeasure = lik = dnorm(reports,nearbyint(H),r,give_log)). 
+
+To make the plot clear, all the $(\beta, \eta, r)$s lead to filtering failures are removed.
+
+### Likelihood at the last filtering iteration of IF2 EAKF
+
+```{r}
+registerDoRNG(900242054)
+SI.simple.binomial <- SI.simple
+foreach(mf=SI.norm[-index[if.error]],.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    coef(SI.simple.binomial) <- coef(mf)
+    evals <- replicate(5, logLik(pfilter(SI.simple.binomial,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.eakf;results.eakf
+
+bake(file = "sir2.eakf.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.norm[-index[if.error]], 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir2.eakf.0.95index
+}
+) -> sir2.eakf.0.95index
+mean(sir2.eakf.0.95index[sir2.eakf.0.95index!=51])
+```
+
+Out of 52 no crash repetitions, only 15 of them find the $(\beta,\eta)$ falling in $0.95$ CI before the 50th iteration. In other words, running IF2 EAKF for 1000 times only gives us 15 reliable estimates of $(\beta,\eta)$.
+
+For the repetitions which find the $(\beta,\eta)$ in 0.95 CI before the 50th iteration, the average iterations IF2 EAKF need to get the $(\beta,\eta)$ in 0.95 CI is 24.8125.
+
+## Comparison of Likelihood surface
+
+Use the information in section $6.3,6.4$ and $6.5$,  we summarize the likelihood and parameter values at the last filtering iteration given by IF2, IF2 EnKF and IF2 EAKF in the plot. The parameters used in these algorithms are:
+
+
+| Method        | Np          | Nmif  | Repeats|
+| ------------- |:-----------:| -----:|------:| 
+| IF2           | 2000        | 50    |50     |
+| IF2 EnKF      | 200         | 50    |50     |
+| IF2 EAKF      | 200         | 50    |1000   |
+
+
+To make the plot clear, all the repetitions with the last filtering iteration's log likelihood < -500 are removed.
+
+The Likelihood surface:
+```{r,echo = FALSE}
+require(GGally)
+results.mif$method <- "Mif2"
+results.enkf$method <- "EnKF"
+results.eakf$method <- "EAKF"
+results <- rbind(results.mif,results.enkf,results.eakf)
+results$neg.loglik <- -results$loglik
+results2 <- na.omit(results[results$neg.loglik < 500,])
+results2[,c(1,3,6,10,9)] %>%
+  ggpairs(.,
+          #lower = list(continuous = wrap("smooth", alpha = 0.3, size=0.1), 
+          #             discrete = "blank", combo="blank"), 
+          title = "SI Binomial fit by SI Normal, IF2 vs IF2 EnKF vs IF2 EAKF",
+          mapping = ggplot2::aes(colour=method),
+          diag = list(discrete="barDiag", 
+                      continuous = wrap("densityDiag", alpha=0.5 )),
+          lower = list(continuous = wrap("smooth", alpha = 0.3, size=1))) -> compare.enkf.mif
+compare.enkf.mif
+```
+
+As we can see, IF2 converge to $(\beta,\eta)$ different from IF2 EnKF and EAKF. The distribution of $(\beta,\eta)$ computed by IF2 EnKF is the most intense one.
+
+Also, there is almost no correlation between the $r$ and $(\beta,\eta)$ for all of IF2, IF2 EnKF and IF2 EAKF.
+
+## Comparison of the Time Consumption
+
+Since none of the IF2 repetitions find the $(\beta,\eta)$ falling in the 0.95 CI constructed by the Binomial SIR, here we only compare IF2 EnKF with IF2 EAKF.
+
+1. The red bars represent the time consumption of IF2 EnKF and EAKF with $Nmif = 50$.
+
+2. The green bars represent the time consumption of IF2 EnKF and EAKF before they get a $(\beta,\eta)$ which falls in the 0.95 confidence interval.
+
+The average iterations that IF2 EnKF need to get a $(\beta,\eta)$ in 0.95 CI is $7.42 \approx 8$, thus the green bar of IF2 EnKF represents the time consumption IF2 EnKF with $Nmif = 8$.
+
+For those runs which do not crash, the average iterations IF2 EAKF need to get such $(\beta,\eta)$ in 0.95 CI is $24.8125 \approx 25$. Since we can only get 15 reliable estimates of $(\beta,\eta)$ from 1000 runs of IF2 EAKF, we should further divide the time consumption of IF2 EAKF with $Nmif = 25$ by 0.015, which is represented by the green bar of IF2 EAKF in the plot below:
+
+
+```{r,echo=FALSE}
+time.sir <- data.frame(
+  Type = c(rep("Nmif in algorithm ", each=2),rep("Nmif parameters in 0.95 CI", each=2)),
+  Method = rep(c("IF2 EnKF,Np = 200", "IF2 EAKF,Np = 200"),2),
+  time = c(4.8545,2.7134,0.7742,1.3723/0.015),
+  Nmif = c(rep("Nmif = 50", each=2),"Nmif = 8","Nmif = 25 with 1.5% No crash rate")
+)
+time.sir$Method <- factor(time.sir$Method,
+    levels = c("IF2 EnKF,Np = 200", "IF2 EAKF,Np = 200"),ordered = TRUE)
+ggplot(data=time.sir, aes(x=Method, y=time, fill=Type,label = Nmif)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  geom_label(
+    position = position_dodge(width = 1),
+    vjust = -0.5, size = 5) +
+  theme(legend.position="bottom")+
+  expand_limits(y = 100,x = 3)
+
+```
+
+If the issue of SVD in IF2 EAKF is considered, IF2 EnKF is approximately 120 times faster than IF2 EAKF.
+
+## Comparison of the $(\beta,\eta)$ before and after iterated filtering
+
+Here we compare the distribution of $(\beta,\eta)$ before and after we applied the algorithms of IF2, IF2 EnKF and IF2 EAKF. To make the plot clear, we only show the $(\beta,\eta)$ computed by IF2 EAKF which has the last iteration's likelihood > -500.
+
+From the plot below, we can see that IF2 make $(\beta,\eta)$ converge to the green vertical line and IF2 EnKF make $(\beta,\eta)$ converge to the orange vertical line. The $(\beta,\eta)$ value of the orange line is close to the $(16,0.2)$, which is exactly the value we used to generate the simulation.
+
+If there is no SVD problem,IF2 EAKF and IF2 EnKF may converge to the same $(\beta,\eta)$.
+
+For the results of all three algorithms, there is no obvious correlation between $(\beta,\eta)$ and $r$.
+
+
+```{r,fig.height=7,cache=FALSE,echo=FALSE}
+library(plotly)
+index.na <- is.na(results.mif$loglik)
+index.mif <- (results.mif$loglik > -129.7141)
+index.mif[index.na] <- FALSE
+sir.init <- par.starts.sir.2[1:50,c(1,3,6)]
+sir.init$Type <- "Initial"
+if.end <- results.mif[,c(1,3,6)]
+if.end$Type <- "End.IF2"
+enkf.end <- results.enkf[,c(1,3,6)]
+enkf.end$Type <- "End.IF2_EnKF"
+eakf.end <- results.eakf[results.eakf$loglik > -500,c(1,3,6)]
+eakf.end$Type <- "End.logLik<-500.IF2_EAKF"
+InitEnd <- rbind(sir.init,
+                 if.end,
+                 enkf.end,
+                 eakf.end)
+
+plot_ly(InitEnd,x=~Beta, y=~eta, z=~r,color = ~Type, type="scatter3d", mode="markers",marker = list(size = 4)) %>%
+  layout(legend = list(orientation = "h", x = 0, y = -0.1))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Fit data of SIR model with binomial noise by SIR model with normal noise (r take a random walk)
+
+In this section, we will repeat what we did in Section 6. The only difference is this time, the standard error of the measurement noise $r$, is allowed to take a random walk along with $(\beta,\eta)$.
+
+## Code of the SIR model with normal noise
+
+```{r}
+sir_step <- Csnippet("
+  S = nearbyint(abs(S));
+  I = nearbyint(abs(I));
+  H = nearbyint(abs(H));
+  double dN_SI = rbinom(S,1-exp(-Beta*I/N*dt));
+  double dN_IR = rbinom(I,1-exp(-mu_IR*dt));
+  S -= dN_SI;
+  I += dN_SI - dN_IR;
+  H += dN_IR;
+")
+data.frame(week = seq(0, 20, by = 1 / 2), 
+           reports = as.data.frame(SI.simple)$reports)  %>%
+  pomp(
+    times="week",t0=0,
+    rprocess=euler(sir_step,delta.t=1/7),
+    rinit= Csnippet("
+                    S = nearbyint(eta*N);
+                    I = 1;
+                    H = 0;
+                    "),
+    rmeasure= Csnippet("
+                       reports = rbinom(nearbyint(H),rho);
+                       "),
+    dmeasure= Csnippet("
+                        lik = dnorm(reports,nearbyint(H),r,give_log);
+                      "),
+    accumvars="H",
+    partrans=parameter_trans(log=c("Beta","mu_IR","r"),logit=c("eta","rho")),
+    statenames=c("S","I","H"),
+    paramnames=c("Beta","mu_IR","eta","N","r","rho"),
+    params= c(Beta=16,mu_IR=2,rho=0.8,eta=0.2,N=100000,r = 13)
+  ) -> SI.simple.2
+par.starts.sir.2 <- sobolDesign(lower = 
+                                c(Beta=8,mu_IR=2,eta=0.1,rho = 0.8,N=100000,r = 5),
+                                upper = 
+                                c(Beta=32,mu_IR=2,eta=0.4,rho = 0.8,N=100000,r = 20),                                  nseq = 1000)
+
+```
+
+In the SIR model with normal measurement noise, the standard error of the measurement noise is a parameter $r$ embedded in the POMP model. 
+
+To apply the algorithms of IF2 EnKF and IF2 EAKF, we use the following function to retrieve $r$ from the POMP model:
+
+```{r}
+R <- function(x){matrix((x["r"])^2)}
+```
+
+## Example of Simulation generated by Binomial SIR (Same to section 5.2)
+
+```{r,echo=FALSE}
+siData <- as.data.frame(SI.simple)
+siData <- melt(siData,id.vars = c("week"))
+ggplot(siData, aes(x=week, y=value,col = variable)) + 
+  geom_line() +
+  facet_wrap( ~ variable, ncol=2, scales = "free") +
+  theme(legend.position="bottom")
+set.seed(3000614)
+## Log likelihood at the true parameter value:
+MLE.lik <- logmeanexp(replicate(5,logLik(pfilter(SI.simple,Np = 10000))))
+MLE.95.lik <- logmeanexp(replicate(5,logLik(pfilter(SI.simple,Np = 10000)))) - 
+  0.5*qchisq(df=2,p = 0.95)
+as.data.frame(cbind(MLE.lik,MLE.95.lik))
+```
+
+We approximate the Log likelihood of the MLE with the Log likelihood of the example of simulation at the true parameter value (= -127.3501). This Log likelihood is computed by the SIR model with **Binomial noise**.
+
+The $(\beta,\eta)$ which has log Likelihood > -129.9659 is in the 0.95 confidence interval.
+
+## Search $(\beta,\eta)$ by IF2
+
+### Diagnostic plot of IF2
+
+```{r}
+################ MIF2 ###############
+registerDoRNG(3000616)
+rm(SI.bin.locol)
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple.2) <- par.starts.sir.2[i,]
+    
+    SI.simple.2 %>%
+    # # ###* Start of Mif2 *####
+    mif2(
+      Np=2000,
+      Nmif=50,
+      cooling.fraction.50=0.5,
+      tol = 0,
+      rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02),r = 0.02)
+    )
+    # # ###* End of Mif2 *####
+  } -> SI.norm
+
+
+SI.norm %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+In the diagnostic plot, the log likelihood is computed by the SI model with normal noise, (i.e. dmeasure = lik = dnorm(reports,nearbyint(H),r,give_log)).
+
+### Likelihood at the last filtering iteration of IF2 
+
+```{r}
+registerDoRNG(900242056)
+SI.simple.binomial <- SI.simple
+foreach(mf=SI.norm,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    coef(SI.simple.binomial) <- coef(mf)
+    evals <- replicate(5, logLik(pfilter(SI.simple.binomial,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.mif.2;results.mif.2
+
+bake(file = "sir2.rWalk.if2.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.norm, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir2.if2.0.95index
+}
+) -> sir2.if2.0.95index
+mean(sir2.if2.0.95index)
+```
+
+We compute the likelihood at the last filtering iteration of IF2 by the SI model with **Binomial noise**. To do that, we ignore the value of $r$ and only plug the value of $(\beta,\eta)$ into the Binomial SIR model. 
+
+As a result, if we choose to run IF2 with the normal SIR model, none of 50 repetitions has $(\beta,\eta)$ falling in the 0.95 CI constructed by the binomial SIR model before 50 iterations.
+
+In the section 7.7, we can find that, 50 points of $(\beta,\eta,r)$ computed by the IF2 do not converge to a particular point. As a instead, there are strong negative correlation between $\beta$ and $r$ and positive correlation between $\eta$ and $r$.
+
+
+
+## Search $(\beta,\eta)$ by IF2 EnKF
+
+### Diagnostic plot of IF2 EnKF
+
+```{r}
+registerDoRNG(3000613)
+h.enkf <- function(x){0.8*x["H"]}
+R <- function(x){matrix((x["r"])^2)}
+
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple.2) <- par.starts.sir.2[i,]
+    
+    SI.simple.2 %>%
+    ###* Start of Mif2 EnKF *####
+    mif.enkf(
+      Np=200,
+      Nmif=50,
+      cooling.fraction.50=0.5,
+      tol = 0,
+      h = h.enkf,
+      R = R,
+      cooling.type = "geometric",
+      check.fail = TRUE,
+      rw.sd=rw.sd(Beta=0.02,eta=ivp(0.02),r = 0.02)
+    )
+    ###* End of Mif2 EnKF *####
+  } -> SI.norm
+
+SI.norm %>%
+  traces() %>%
+  melt() -> na.remove.data
+is.na(na.remove.data) <- sapply(na.remove.data, is.infinite)
+na.remove.data %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+In the diagnostic plot, the log likelihood is computed by the SI model with normal noise, (i.e. dmeasure = lik = dnorm(reports,nearbyint(H),r,give_log)).
+
+### Likelihood at the last filtering iteration of IF2 EnKF
+
+```{r}
+registerDoRNG(900242056)
+SI.simple.binomial <- SI.simple
+foreach(mf=SI.norm,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    coef(SI.simple.binomial) <- coef(mf)
+    evals <- replicate(5, logLik(pfilter(SI.simple.binomial,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.enkf.2;results.enkf.2
+
+bake(file = "sir2.rWalk.enkf.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.norm, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir2.enkf.0.95index
+}
+) -> sir2.enkf.0.95index
+mean(sir2.enkf.0.95index)
+```
+
+49 out of 50 repetitions of IF2 EnKF find out the parameter values of $(\beta,\eta)$ falling in 0.95 CI constructed by the **Binomial** SI model before $Nmif = 50$, no matter what the value of $r$ is.
+
+The average $Nmif$ before the algorithm get a combination of $(\beta,\eta)$ which is in 0.95 CI $(logLik >-129.7141)$ is  8.3.
+
+## Search $(\beta,\eta)$ by IF2 EAKF
+
+### Diagnostic plot of IF2 EAKF
+
+Allow $r$ to take a random walk can avoid the carsh of IF2 EAKF, thus different from Section 6.5, here I just run IF2 EAKF for 50 repetitions.
+
+```{r}
+################EAKF###############
+registerDoRNG(3000613)
+R <- function(x){matrix((x["r"])^2)}
+rho <- 0.8
+C <- matrix(c(0, 0, 1), 1, 3, byrow = TRUE)*rho
+dimX <- ncol(C)
+dimY <- nrow(C)
+rownames(C) <- paste0("reports", seq_len(dimY))
+colnames(C) <- statenames <- c("S", "I", "H")
+
+
+registerDoRNG(3000615)
+foreach(i=1:50,.combine=c) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    
+    coef(SI.simple.2) <- par.starts.sir.2[i,]
+    
+    {
+      SI.simple.2 %>%
+        ###* Start of Mif2 EAKF *####
+      mif.eakf(
+        Np=200,
+        Nmif=50,
+        cooling.fraction.50=0.5,
+        tol = 0,
+        R = R,
+        C = C,
+        cooling.type = "geometric",
+        check.fail = TRUE,
+        tolerance = 1e-200,
+        rw.sd=rw.sd(Beta=0.02,eta = ivp(0.02),r = 0.02)
+      )
+    }
+    ###* End of Mif2 EAKF *####
+  } -> SI.norm
+
+SI.norm %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group = L1, colour = factor(L1)))+
+  geom_line()+
+  guides(color=FALSE)+
+  facet_wrap(~variable,scales="free_y")+
+  theme_bw()
+```
+
+
+In the diagnostic plot, the log likelihood is computed by the SI model with normal noise, (i.e. dmeasure = lik = dnorm(reports,nearbyint(H),r,give_log)). 
+
+
+### Likelihood at the last filtering iteration of IF2 EAKF
+
+```{r}
+registerDoRNG(900242054)
+SI.simple.binomial <- SI.simple
+foreach(mf=SI.norm,.combine=rbind) %dopar%
+  {
+    library(pomp)
+    library(tidyverse)
+    coef(SI.simple.binomial) <- coef(mf)
+    evals <- replicate(5, logLik(pfilter(SI.simple.binomial,Np=10000)))
+    ll <- logmeanexp(evals,se=TRUE)
+    mf %>% coef() %>% bind_rows() %>%
+      bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results.eakf.2;results.eakf.2
+
+bake(file = "sir2.rWalk.eakf.0.95index.rds",{
+  index.95(object = SI.simple,
+           coefList = SI.norm, 
+           MLE.CI = MLE.95.lik, 
+           Np = 1000) -> sir2.enkf.0.95index
+}
+) -> sir2.eakf.0.95index
+mean(sir2.eakf.0.95index[sir2.eakf.0.95index!=51])
+```
+
+Only 3 out of 50 repetitions of IF2 EAKF find out the parameter values of $(\beta,\eta)$ falling in 0.95 CI constructed by the **Binomial** SI model before $Nmif = 50$.
+
+The starting points of the repetitions which find the $(\beta,\eta)$ in 0.95 CI are $(\beta,\eta,r) = (18.6,0.190,12.5), (23.8,0.199,13.9)$ and $(31.69,0.195,14.6)$, clearly the values of $\eta$ of these initial points are close to the truth value $\eta = 0.2$. It seems that IF2 EAKF are not good at adjusting the value of $\eta$. 
+
+For the repetitions which find the $(\beta,\eta)$ in 0.95 CI before the 50th iteration, the average iterations IF2 EAKF need to get the $(\beta,\eta)$ in 0.95 CI is 2. 
+
+
+## Comparison of Likelihood surface
+
+Use the information in section $7.3,7.4$ and $7.5$,  we summarize the likelihood and parameter values at the last filtering iteration given by IF2, IF2 EnKF and IF2 EAKF in the plot. The parameters used in these algorithms are:
+
+
+| Method        | Np          | Nmif  | Repeats|
+| ------------- |:-----------:| -----:|------:| 
+| IF2           | 2000        | 50    |50     |
+| IF2 EnKF      | 200         | 50    |50     |
+| IF2 EAKF      | 200         | 50    |50     |
+
+
+To make the plot clear, all the repetitions with the last filtering iteration's log likelihood < -500 are removed.
+
+The Likelihood surface:
+```{r,fig.width=8,fig.height==8,echo = FALSE}
+require(GGally)
+results.mif.2$method <- "Mif2"
+results.enkf.2$method <- "EnKF"
+results.eakf.2$method <- "EAKF"
+results <- rbind(results.mif.2,results.enkf.2,results.eakf.2)
+results$neg.loglik <- -results$loglik
+results2 <- na.omit(results[results$neg.loglik < 500,])
+results2[,c(1,3,6,10,9)] %>%
+  ggpairs(.,
+          #lower = list(continuous = wrap("smooth", alpha = 0.3, size=0.1), 
+          #             discrete = "blank", combo="blank"), 
+          title = "SI Binomial fit by SI Normal, IF2 vs IF2 EnKF vs IF2 EAKF",
+          mapping = ggplot2::aes(colour=method),
+          diag = list(discrete="barDiag", 
+                      continuous = wrap("densityDiag", alpha=0.5 )),
+          lower = list(continuous = wrap("smooth", alpha = 0.3, size=1))) -> compare.enkf.mif
+compare.enkf.mif
+```
+
+In the firgue above, we can observe that, for the points computed by IF2 and IF2 EAKF, there are negative correlation between $\beta$ and $r$ and positive correlation between $\eta$ and $r$. 
+The $(\beta,\eta)$s computed by IF2 EnKF converge to a point mass.
+
+
+## Comparison of the $(\beta,\eta)$ before and after iterated filtering
+
+Here we compare the distribution of $(\beta,\eta,r)$ before and after we applied the algorithms of IF2, IF2 EnKF and IF2 EAKF. To make the plot clear, we only show the $(\beta,\eta)$ computed by IF2 EAKF which has the last iteration's likelihood > -500.
+
+We can clearly observe that, for the points computed by IF2 and IF2 EAKF, there are negative correlation between $\beta$ and $r$ and positive correlation between $\eta$ and $r$. The $(\beta,\eta)$s computed by IF2 EnKF converge to the point mass $(16,0.2)$, which is same to Section 6.8 .
+
+
+
+```{r,fig.height=7,cache=FALSE,echo=FALSE}
+library(plotly)
+index.na <- is.na(results.mif.2$loglik)
+index.mif <- (results.mif.2$loglik > -500)
+index.mif[index.na] <- FALSE
+
+sir.init <- par.starts.sir.2[1:50,c(1,3,6)]
+sir.init$Type <- "Initial"
+if.end <- results.mif.2[,c(1,3,6)]
+if.end$Type <- "End.IF2"
+enkf.end <- results.enkf.2[,c(1,3,6)]
+enkf.end$Type <- "End.IF2_EnKF"
+eakf.end <- results.eakf.2[results.eakf.2$loglik > -500,c(1,3,6)]
+eakf.end$Type <- "End.logLik<-500.IF2_EAKF"
+InitEnd <- rbind(sir.init,
+                 if.end,
+                 enkf.end,
+                 eakf.end)
+
+plot_ly(InitEnd,x=~Beta, y=~eta, z=~r,color = ~Type, type="scatter3d", mode="markers",marker = list(size = 4)) %>%
+  layout(legend = list(orientation = "h", x = 0, y = -0.1))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Comparison of time consumption for the different Np values
+
+In this section, we compare the elapsed time consumption of IF2, IF2 EnKF and IF2 EAKF for the different Np values. The parameter $Nmif$ is fixed to be 50, and number of particles $Np$ ranges from 100 to 20000 by 100. These experiments are run on the clusters of compute canada.
+
+In IF2 EnKF and IF2 EnKF, whether we compute likelihood and check the filtering failure will not affect the proceeding of the algorithm. We will compare the time consumption when $check.fail = TRUE$ and $check.fail = FALSE$ separately. 
+
+The time consumption of IF2 times 5 and the time consumption of IF2 times 10 are shown for better comparison.
+
+Notice that in the previous experiments, IF2 EnKF and IF2 EAKF may achieve a better performance with $\frac{1}{10}$ particles size of IF2.
+
+## check.fail = TRUE in mif2.enkf $\&$ mif2.eakf
+
+```{r}
+require(reshape)
+time.data <- read.csv("Summary_1.csv")
+time.data$MIF2_5.Times <- time.data$MIF2*5
+time.data$MIF2_10.Times <- time.data$MIF2*10
+colnames(time.data)[5:6] <- c("MIF2 * 5", "MIF2 * 10")
+time.data <- melt(time.data, id=c("Particle"))
+colnames(time.data) <- c("Particle","Method","Elapsed.Time")
+time.data %>%
+  ggplot(aes(x=Particle,y=Elapsed.Time,group = Method, colour = Method))+
+  geom_point(alpha = .15,size = 0.2) + 
+  geom_smooth(method = "lm", se = FALSE)+
+  ggtitle("Elapsed Time versus Np (Check Failure = TRUE)") +
+  theme(legend.position="bottom")
+```
+
+## check.fail = FALSE in mif2.enkf $\&$ mif2.eakf
+
+```{r}
+time.data <- read.csv("Summary_2.csv")
+time.data$MIF2_5.Times <- time.data$MIF2*5
+time.data$MIF2_10.Times <- time.data$MIF2*10
+colnames(time.data)[5:6] <- c("MIF2 * 5", "MIF2 * 10")
+time.data <- melt(time.data, id=c("Particle"))
+colnames(time.data) <- c("Particle","Method","Elapsed.Time")
+time.data %>%
+  ggplot(aes(x=Particle,y=Elapsed.Time,group = Method, colour = Method))+
+  geom_point(alpha = .25,size = 0.2) + 
+  geom_smooth(method = "lm", se = FALSE)+
+  ggtitle("Elapsed Time versus Np (Check Failure = FALSE)") +
+  theme(legend.position="bottom")
+```
+
+# R source code of IF EnKF
+```{r, eval=FALSE}
+#################################
+##########*** EnKF ***###########
+#################################
+enkf.internal <- function(object, params, Np, mifiter, rw.sd, cooling.fn,
+                            tol = 0, max.fail = Inf, verbose,
+                            h,R,check.fail,
+                            .indices = integer(0),
+                            .gnsi = TRUE,tolerance){
+  #####* General initialization *#####
+  tol <- as.numeric(tol)
+  gnsi <- as.logical(.gnsi)
+  verbose <- as.logical(verbose)
+  mifiter <- as.integer(mifiter)
+  Np <- as.integer(Np)
+  
+  if (length(tol) != 1 || !is.finite(tol) || tol < 0)
+    pStop_(sQuote("tol")," should be a small nonnegative number.")
+  
+  do_ta <- length(.indices)>0L
+  if (do_ta && length(.indices)!=Np[1L])
+    pStop_(sQuote(".indices")," has improper length.")
+  
+  times <- time(object,t0=TRUE)
+  ntimes <- length(times)-1
+  
+  ## Check the numer of filtering failure
+  nfail <- 0
+  
+  #####* Kalman initialization *#####
+  loglik <- numeric(ntimes)
+  y <- obs(object) ## observation time series data
+  nobs <- nrow(y) ## dim of observation 
+  Y <- array(dim=c(nobs,Np),dimnames=list(variable=rownames(y),rep=NULL)) ## ensemble of measurements
+  X <- rinit(object,params=coef(object),nsim=Np) ## ensemble of hidden states
+  nvar.names <- rownames(rinit(object,params=coef(object),nsim=Np)) ## name of hidden state
+  nvar <- nrow(X) ## dim of hidden state 
+  
+  ## name of parameters which do random walk
+  npar.names <- names(cooling.fn(1,mifiter)$alpha*rw.sd[,1]) 
+  
+  #####* Start of the main loop *#####
+  for (nt in seq_len(ntimes)) {
+    
+    ## decide parameter variance at nt
+    pmag <- cooling.fn(nt,mifiter)$alpha*rw.sd[,nt]
+    
+    ## Forecast 1.0 : Add noise to parameters
+    for (par.name in npar.names) {
+      params[par.name,] <- rnorm(n = dim(params)[2], 
+                                 mean = params[par.name,],
+                                 sd = pmag[par.name])
+    }
+    
+    ## Forecast 1.1 : Change parameters back to original scale 
+    tparams <- pomp::partrans(object,params,dir="fromEst",.gnsi=gnsi)
+    
+    
+    ## Forecast 1.2 Get initial states (if nt = 1) and add noise
+    if (nt == 1L) {
+      x <- pomp::rinit(object,params=tparams)
+    }
+    
+    ## Forecast 2.1 Advance the hidden states according to the process model
+    X[,] <- pomp::rprocess(
+      object,
+      x0=x,
+      t0=times[nt],
+      times=times[nt+1],
+      params=tparams,
+      .gnsi=gnsi
+    )
+    
+
+    ######* Check if failure happens, not necessary in algorithm*#####
+    if(check.fail){
+      weights <- pomp::dmeasure(
+        object,
+        y=object@data[,nt,drop=FALSE],
+        x=array(X,dim=c(dim(X),1),dimnames=list(variable=rownames(X))),
+        times=times[nt+1],
+        params=tparams,
+        log=FALSE,
+        .gnsi=gnsi
+      )
+      
+      ## Apply tolerance to decide which ensemble fail
+      index.missing <- weights <= tol
+      weights[index.missing] <- 0
+      loglik[nt] <- ifelse(sum(weights) == 0, 
+                           #log(1e-17),
+                           #log(.Machine$double.xmin), 
+                           -Inf,
+                           log(mean(weights)))
+      
+      
+      if(  sum(weights) == 0){
+        nfail <- nfail + 1
+      }
+    }
+    
+    
+    #####* Compute weighted mean at last timestep if no faiure, otherwise take unweighted mean *#####
+    if(nt == ntimes){
+      weights <- pomp::dmeasure(
+        object,
+        y=object@data[,nt,drop=FALSE],
+        x=array(X,dim=c(dim(X),1),dimnames=list(variable=rownames(X))),
+        times=times[nt+1],
+        params=tparams,
+        log=FALSE,
+        .gnsi=gnsi
+      )
+      
+      ##*Apply tolerance
+      index.missing <- weights <= tol
+      weights[index.missing] <- 0
+      
+      ##*Normalize
+      weights <- weights/sum(weights)
+      
+      ##*Remove NA, aovid all 0 since all 0 will produce NaN
+      weights[is.na(weights)] <- 0
+      
+      if(sum(weights) != 0){
+        coef(object,transform=TRUE) <- apply(X = params,
+                                             MARGIN = 1,
+                                             FUN = weighted.mean,
+                                             w = weights)
+      }
+      else{
+        coef(object,transform=TRUE) <- apply(X = params,
+                                             MARGIN = 1,
+                                             FUN = mean)
+      }
+    }
+    
+    ## Forecast 3.0 Get the extended hidden state (hidden state + parameters which can change)
+    x.e <- rbind(X,params[npar.names,,drop=F])
+    
+    #####* Update states in EAKF
+    pm <- rowMeans(x.e)  ## prediction mean of the hidden states
+    Y[,] <- apply(rbind(X,tparams[npar.names,]),2,h) ## ensemble of forecasts
+    
+
+    ## Approximate the measurement noise by function R 
+    ## and predicted mean parameters and hidden states 
+    R.num <- R(rowMeans(rbind(X,tparams[,])))
+    if(any(diag(R.num) < 0) || any(is.na(R.num)) ){
+      stop('Measurement error is uncomputable')
+    }
+    ## Here we assign R a small value since in Kalman algorithm, since we have:
+    ##              fv <- tcrossprod(Y)/(Np-1)+R,    (Here Y can be 0)
+    ##                svdS <- svd(fv,nv=0) 
+    ##      Kt <- svdS$u%*%(crossprod(svdS$u,vyx)/svdS$d)
+    ##            We need to avoid svdS$d = 0 to make /svdS$d work
+    
+    ## Replace the variance which is 0 with the tolerance
+    if(length(R.num) > 1){
+      if(any(diag(R.num) == 0)){
+        index <- diag(R.num) == 0
+        diag(R.num)[index] <- tolerance
+      }
+
+    }else{
+      if(R.num == 0){
+        R.num <- tolerance
+      }
+    }
+
+    sqrtR <- t(chol(R.num))
+
+    ym <- rowMeans(Y)                  ## forecast mean
+    
+    x.e <- x.e-pm
+    Y <- Y-ym
+    
+    fv <- tcrossprod(Y)/(Np-1)+R.num    ## forecast variance
+    
+    vyx <- tcrossprod(Y,x.e)/(Np-1)   ## forecast/state covariance
+    
+    
+    svdS <- svd(fv,nv=0)            ## singular value decomposition
+    
+    Kt <- svdS$u%*%(crossprod(svdS$u,vyx)/svdS$d) ## transpose of Kalman gain
+    Ek <- sqrtR%*%matrix(rnorm(n=nobs*Np),nobs,Np) ## artificial noise
+    resid <- y[,nt]-ym
+    
+    x.e <- x.e+pm+crossprod(Kt,resid-Y+Ek) ## updated hidden state
+    
+    ## break the extended hidden to changable parameters and hidden state
+    x <- x.e[nvar.names,]
+    params[npar.names,] <- x.e[npar.names,]
+    
+    ## compute the likelihood using the extended hidden state using matrix
+    #loglik[nt] <- sum(dnorm(x=crossprod(svdS$u,resid),mean=0,sd=sqrt(svdS$d),log=TRUE))
+    
+  }
+  
+  return(new(
+    "pfilterd_pomp",
+    as(object,"pomp"),
+    paramMatrix=params,
+    cond.loglik=loglik,
+    indices=.indices,
+    Np=Np,
+    nfail = as.integer(nfail),
+    tol=tol,
+    loglik=sum(loglik)
+  ))}
+
+
+
+mif.enkf <- function(object, Nmif, rw.sd,
+                       cooling.fraction.50,
+                       ## h,R is for Enkf
+                       h,R,
+                       Np, max.fail = Inf,
+                       ..., verbose = FALSE,check.fail = FALSE,
+                       cooling.type = "geometric",tol = 0,
+                       .ndone = 0L, .indices = integer(0), .paramMatrix = NULL,
+                       .gnsi = TRUE,tolerance = 1e-100){
+  
+  ### Default initialization in pomp package 
+  verbose <- as.logical(verbose)
+  check.fail <- as.logical(check.fail)
+  object <- pomp(object,verbose=verbose)
+  
+  gnsi <- as.logical(.gnsi)
+  
+  if (length(Nmif) != 1 || !is.numeric(Nmif) || !is.finite(Nmif) || Nmif < 1)
+    pStop_(sQuote("Nmif")," must be a positive integer.")
+  Nmif <- as.integer(Nmif)
+  
+  if (is.null(.paramMatrix)) {
+    start <- coef(object)
+  } else {
+    start <- apply(.paramMatrix,1L,mean)
+  }
+  
+  ntimes <- length(pomp::time(object))
+  
+  if (is.null(Np)) {
+    pStop_(sQuote("Np")," must be specified.")
+  } else if (is.function(Np)) {
+    Np <- tryCatch(
+      vapply(seq_len(ntimes),Np,numeric(1)),
+      error = function (e) {
+        pStop_("if ",sQuote("Np"),
+               " is a function, it must return a single positive integer.")
+      }
+    )
+  } else if (!is.numeric(Np)) {
+    pStop_(sQuote("Np"),
+           " must be a number, a vector of numbers, or a function.")
+  }
+  
+  if (!all(is.finite(Np)) || any(Np <= 0))
+    pStop_(sQuote("Np")," must be a positive integer.")
+  
+  Np <- as.integer(Np)
+  
+  if (missing(rw.sd))
+    pStop_(sQuote("rw.sd")," must be specified!")
+  
+  ###### Create the list of perturbed noise, use perturbn.kernel.sd function ######
+  rw.sd <- perturbn.kernel.sd(rw.sd,time=time(object),paramnames=names(start))
+  
+  if (missing(cooling.fraction.50))
+    pStop_(sQuote("cooling.fraction.50")," is a required argument.")
+  if (length(cooling.fraction.50) != 1 || !is.numeric(cooling.fraction.50) ||
+      !is.finite(cooling.fraction.50) || cooling.fraction.50 <= 0 ||
+      cooling.fraction.50 > 1)
+    pStop_(sQuote("cooling.fraction.50")," must be in (0,1].")
+  cooling.fraction.50 <- as.numeric(cooling.fraction.50)
+  
+  ###### Choose cooling method and time, use mif2.cooling function ######
+  cooling.fn <- mif2.cooling(
+    type=cooling.type,
+    fraction=cooling.fraction.50,
+    ntimes=length(time(object))
+  )
+  
+  if (is.null(.paramMatrix)) {
+    paramMatrix <- array(data=start,dim=c(length(start),Np[1L]),
+                         dimnames=list(variable=names(start),rep=NULL))
+  } else {
+    paramMatrix <- .paramMatrix
+  }
+  
+  traces <- array(dim=c(Nmif+1,length(start)+1+
+                          1),
+                  dimnames=list(iteration=seq.int(.ndone,.ndone+Nmif),
+                                variable=c("loglik","nfail",names(start))))
+  traces[1L,] <- c(NA,NA,start)
+  
+  pomp::pompLoad(object,verbose=verbose)
+  on.exit(pompUnload(object,verbose=verbose))
+  
+  ## change the parameter scale, change it back in the loop of enkf
+  paramMatrix <- partrans(object,paramMatrix,dir="toEst",
+                          .gnsi=gnsi)
+  
+  ###### iterate the filtering of EnKF #######
+  
+  ## iterate the filtering
+  for (n in seq_len(Nmif)) {
+    pfp <- enkf.internal(
+      object=object,
+      params=paramMatrix,
+      Np= Np,
+      R = R,
+      h = h,
+      ## n is the number in this loop
+      mifiter=.ndone+n,
+      cooling.fn=cooling.fn,
+      rw.sd=rw.sd,
+      check.fail = check.fail,
+      tol=tol,
+      max.fail=max.fail,
+      verbose=verbose,
+      .indices=.indices,
+      .gnsi=gnsi,
+      tolerance
+    )
+    
+    gnsi <- FALSE
+    
+    paramMatrix <- pfp@paramMatrix
+    traces[n+1,-c(1L,2L)] <- coef(pfp)
+    traces[n,1L] <- pfp@loglik
+    traces[n,2L] <- pfp@nfail
+    .indices <- pfp@indices
+    
+    if (verbose) cat("mif2 EnKF iteration",n,"of",Nmif,"completed\n")
+    
+  }
+  pfp@paramMatrix <- partrans(object,paramMatrix,dir="fromEst",.gnsi=gnsi)
+  new(
+    "mif2d_pomp",
+    pfp,
+    Nmif=Nmif,
+    rw.sd=rw.sd,
+    cooling.type=cooling.type,
+    cooling.fraction.50=cooling.fraction.50,
+    traces=traces
+  )}
+```
+
+# R source code of IF EAKF
+
+```{r, eval=FALSE}
+#################################
+##########*** EAKF ***###########
+#################################
+eakf.internal <- function(object, params, Np, mifiter, rw.sd, cooling.fn,
+                          tol = 0, max.fail = Inf, verbose,tolerance,
+                          C,R,check.fail,
+                          .indices = integer(0),
+                          .gnsi = TRUE){
+  #####* General initialization *#####
+  
+  ## tol is the tolerance used to test the filtering 
+  ## failure which defined in Particle Filter
+  tol <- as.numeric(tol)
+  gnsi <- as.logical(.gnsi)
+  verbose <- as.logical(verbose)
+  mifiter <- as.integer(mifiter)
+  Np <- as.integer(Np)
+  
+  if (length(tol) != 1 || !is.finite(tol) || tol < 0)
+    pStop_(sQuote("tol")," should be a small nonnegative number.")
+  
+  do_ta <- length(.indices)>0L
+  if (do_ta && length(.indices)!=Np[1L])
+    pStop_(sQuote(".indices")," has improper length.")
+  
+  times <- time(object,t0=TRUE)
+  ntimes <- length(times)-1
+  
+  ## Check the numer of filtering failure
+  nfail <- 0
+  
+  #####* Kalman initialization *#####
+  loglik <- numeric(ntimes)
+  y <- obs(object) ## observation time series data
+  nobs <- nrow(y) ## dim of observation 
+  Y <- array(dim=c(nobs,Np),dimnames=list(variable=rownames(y),rep=NULL)) ## ensemble of measurements
+  X <- rinit(object,params=coef(object),nsim=Np) ## ensemble of hidden states
+  nvar.names <- rownames(rinit(object,params=coef(object),nsim=Np)) ## name of hidden state
+  nvar <- nrow(X) ## dim of hidden state 
+  
+  ## names of parameters which do random walk
+  npar.names <- names(cooling.fn(1,mifiter)$alpha*rw.sd[,1]) 
+  
+  ## dim of parameters which do random walk
+  npar <- length(npar.names)
+  
+  ### Create extended observation matrix C.e
+  C.p <- matrix(rep(0,npar), nobs, npar, byrow = TRUE)
+  colnames(C.p) <- npar.names
+  C.e <- cbind(C,C.p)
+  
+  #####* Start of the main loop *#####
+  for (nt in seq_len(ntimes)) {
+    
+    ## decide parameter variance at nt
+    pmag <- cooling.fn(nt,mifiter)$alpha*rw.sd[,nt]
+    
+    ## Forecast 1.0 : Add noise to parameters
+    for (par.name in npar.names) {
+      params[par.name,] <- rnorm(n = dim(params)[2], 
+                                 mean = params[par.name,],
+                                 sd = pmag[par.name])
+    }
+    
+    ## Forecast 1.1 : Change parameters back to the original scale
+    tparams <- pomp::partrans(object,params,dir="fromEst",.gnsi=gnsi)
+    
+    
+    ## Forecast 1.2  Get initial states (if nt = 1) and add noise
+    if (nt == 1L) {
+      x <- pomp::rinit(object,params=tparams)
+    }
+    
+    ## Forecast 2.1 Advance the state variables according to the process model
+    X[,] <- pomp::rprocess(
+      object,
+      x0=x,
+      t0=times[nt],
+      times=times[nt+1],
+      params=tparams,
+      .gnsi=gnsi
+    )
+    
+    ######* Check if failure happens, not necessary in algorithm*#####
+    if(check.fail){
+      weights <- pomp::dmeasure(
+        object,
+        y=object@data[,nt,drop=FALSE],
+        x=array(X,dim=c(dim(X),1),dimnames=list(variable=rownames(X))),
+        times=times[nt+1],
+        params=tparams,
+        log=FALSE,
+        .gnsi=gnsi
+      )
+      
+      ## Apply tolerance to decide which ensemble fail
+      index.missing <- weights <= tol
+      weights[index.missing] <- 0
+      loglik[nt] <- ifelse(sum(weights) == 0, 
+                           #log(1e-17),
+                           #log(.Machine$double.xmin), 
+                           -Inf,
+                           log(mean(weights)))
+      
+      
+      if(  sum(weights) == 0){
+        nfail <- nfail + 1
+      }
+    }
+
+    #####* Compute weighted mean at last timestep if no faiure, otherwise take unweighted mean *#####
+    if(nt == ntimes){
+      weights <- pomp::dmeasure(
+        object,
+        y=object@data[,nt,drop=FALSE],
+        x=array(X,dim=c(dim(X),1),dimnames=list(variable=rownames(X))),
+        times=times[nt+1],
+        params=tparams,
+        log=FALSE,
+        .gnsi=gnsi
+      )
+      
+      ##*Apply tolerance
+      index.missing <- weights <= tol
+      weights[index.missing] <- 0
+      
+      ##*Normalize
+      weights <- weights/sum(weights)
+      
+      ##*Remove NA, aovid all 0 since all 0 will produce NaN
+      weights[is.na(weights)] <- 0
+      
+      ## Take weighted sum if no failure
+      if(sum(weights) != 0){
+        coef(object,transform=TRUE) <- apply(X = params,
+                                             MARGIN = 1,
+                                             FUN = weighted.mean,
+                                             w = weights)
+      }
+      else{
+      ## Otherwise take unweighted sum
+        coef(object,transform=TRUE) <- apply(X = params,
+                                             MARGIN = 1,
+                                             FUN = mean)
+      }
+    }
+    
+    ## Forecast 3.0 Get the extended hidden state (hidden state + parameters which can change)
+    x.e <- rbind(X,params[npar.names,,drop=F])
+    
+    #####* Updare steps of EAKF *#####
+    
+    ## Compute the prediction mean of the transformed parameters and hidden states 
+    pm <- rowMeans(x.e)  ## prediction mean
+    x.e <- x.e-pm
+    
+    ## Approximate the measurement noise by function R 
+    ## and predicted mean parameters and hidden states 
+    R.num <- R(rowMeans(rbind(X,tparams[,])))
+    if(any(diag(R.num) < 0) || any(is.na(R.num)) ){
+      stop('Measurement error is uncomputable')
+    }
+    
+    if(length(R.num) > 1){
+      if(any(diag(R.num) == 0)){
+        index <- diag(R.num) == 0
+        diag(R.num)[index] <- tolerance
+        sqrtR <- t(chol(R.num))
+        diag(sqrtR)[index] <- 0
+      }else{
+        sqrtR <- t(chol(R.num))
+      }
+
+    }else{
+      if(R.num == 0){
+        R.num <- tolerance
+        sqrtR <- 0
+      }else{
+        sqrtR <- t(chol(R.num))
+      }
+    }
+
+    pv <- tcrossprod(x.e)/(Np-1)      ## prediction variance
+    svdV <- svd(pv,nv = 0)
+    
+    forecast <- C.e %*% pm        ## forecast (observables)
+    resid <- y[,nt]-forecast     ## forecast error
+    
+    ww <- t(C.e%*%svdV$u)
+    w <- crossprod(ww,svdV$d*ww)+R.num  ## forecast variance
+    svdW <- svd(w,nv=0)
+    
+    ## compute the likelihood using the extended hidden state using matrix
+    ##loglik[nt] <- sum(dnorm(x=crossprod(svdW$u,resid),mean=0,
+                            ##sd=sqrt(svdW$d),log=TRUE))
+    
+    u <- sqrt(svdV$d)*ww
+    u <- tcrossprod(u%*%sqrtR,u)
+    svdU <- svd(u,nv=0)
+
+    ## b is adjustment
+    #### Since sqrt(svdV$d) may have 0 entry, divid by it will lead to Inf
+    #### To avoid that, we give sqrt(svdV$d) a small value = tolerance
+    if(any(svdV$d == 0) ){
+      warning("SVD has numerical issue, adjustment is approximated in computation")
+      b <- svdV$u%*%(sqrt(svdV$d)*svdU$u)%*%
+        (1/sqrt(1+svdU$d)/(sqrt(svdV$d)+tolerance)*t(svdV$u))
+    }else{
+      b <- svdV$u%*%(sqrt(svdV$d)*svdU$u)%*%
+        (1/sqrt(1+svdU$d)/sqrt(svdV$d)*t(svdV$u))
+    }
+
+    if( any(is.na(b)) ){
+      stop('Adjustment is non-computable due to numberical reason, try to increase the number of ensembles to avoid that')
+    }
+    
+    K <- tcrossprod(b%*%pv,b)%*%crossprod(C.e,sqrtR)   # Kalman gain
+    
+    if( any(is.na(K)) ){
+      stop('Kalman Gain is non-computable due to numberical reason, try to increase the number of ensembles to avoid that')
+    }
+    
+    fm <- pm+K%*%resid         ## filter mean
+    
+    x.e[,] <- b%*%x.e+as.vector(fm)  ## filter ensembles 
+  
+    
+    ## break the extended hidden stateto changable parameters and hidden state
+    x <- x.e[nvar.names,]
+    params[npar.names,] <- x.e[npar.names,]
+  }
+  
+  return(new(
+    "pfilterd_pomp",
+    as(object,"pomp"),
+    paramMatrix=params,
+    cond.loglik=loglik,
+    indices=.indices,
+    Np=Np,
+    nfail = as.integer(nfail),
+    tol=tol,
+    loglik=sum(loglik)
+  ))}
+
+
+
+mif.eakf <- function(object, Nmif, rw.sd,
+                     cooling.fraction.50,
+                     C,R,
+                     Np, max.fail = Inf,
+                     ..., verbose = FALSE,check.fail = FALSE,
+                     cooling.type = "geometric",tol = 0,
+                     .ndone = 0L, .indices = integer(0), .paramMatrix = NULL,
+                     .gnsi = TRUE,tolerance = 1e-200){
+  
+  ### Default initialization in POMP package
+  verbose <- as.logical(verbose)
+  check.fail <- as.logical(check.fail)
+  object <- pomp(object,verbose=verbose)
+  
+  gnsi <- as.logical(.gnsi)
+  
+  if (length(Nmif) != 1 || !is.numeric(Nmif) || !is.finite(Nmif) || Nmif < 1)
+    pStop_(sQuote("Nmif")," must be a positive integer.")
+  Nmif <- as.integer(Nmif)
+  
+  if (is.null(.paramMatrix)) {
+    start <- coef(object)
+  } else {  
+    start <- apply(.paramMatrix,1L,mean)
+  }
+  
+  ntimes <- length(pomp::time(object))
+  
+  if (is.null(Np)) {
+    pStop_(sQuote("Np")," must be specified.")
+  } else if (is.function(Np)) {
+    Np <- tryCatch(
+      vapply(seq_len(ntimes),Np,numeric(1)),
+      error = function (e) {
+        pStop_("if ",sQuote("Np"),
+               " is a function, it must return a single positive integer.")
+      }
+    )
+  } else if (!is.numeric(Np)) {
+    pStop_(sQuote("Np"),
+           " must be a number, a vector of numbers, or a function.")
+  }
+  
+  if (!all(is.finite(Np)) || any(Np <= 0))
+    pStop_(sQuote("Np")," must be a positive integer.")
+  
+  Np <- as.integer(Np)
+  
+  if (missing(rw.sd))
+    pStop_(sQuote("rw.sd")," must be specified!")
+  
+  ###### Create list of perturbed noise, use perturbn.kernel.sd function ######
+  rw.sd <- perturbn.kernel.sd(rw.sd,time=time(object),paramnames=names(start))
+  
+  if (missing(cooling.fraction.50))
+    pStop_(sQuote("cooling.fraction.50")," is a required argument.")
+  if (length(cooling.fraction.50) != 1 || !is.numeric(cooling.fraction.50) ||
+      !is.finite(cooling.fraction.50) || cooling.fraction.50 <= 0 ||
+      cooling.fraction.50 > 1)
+    pStop_(sQuote("cooling.fraction.50")," must be in (0,1].")
+  cooling.fraction.50 <- as.numeric(cooling.fraction.50)
+  
+  ###### Choose cooling method and time, use mif2.cooling function ######
+  cooling.fn <- mif2.cooling(
+    type=cooling.type,
+    fraction=cooling.fraction.50,
+    ntimes=length(time(object))
+  )
+  
+  if (is.null(.paramMatrix)) {
+    paramMatrix <- array(data=start,dim=c(length(start),Np[1L]),
+                         dimnames=list(variable=names(start),rep=NULL))
+  } else {
+    paramMatrix <- .paramMatrix
+  }
+  
+  traces <- array(dim=c(Nmif+1,length(start)+1+
+                          1),
+                  dimnames=list(iteration=seq.int(.ndone,.ndone+Nmif),
+                                variable=c("loglik","nfail",names(start))))
+  traces[1L,] <- c(NA,NA,start)
+  
+  pomp::pompLoad(object,verbose=verbose)
+  on.exit(pompUnload(object,verbose=verbose))
+  
+  ## change the parameter scale, change them back in the loop of enkf
+  paramMatrix <- partrans(object,paramMatrix,dir="toEst",
+                          .gnsi=gnsi)
+  
+  ###### iterate the filtering of EAKF #######
+  
+  ## iterate the filtering
+  for (n in seq_len(Nmif)) {
+    pfp <- eakf.internal(
+      object=object,
+      params=paramMatrix,
+      Np= Np,
+      R = R,
+      C = C,
+      mifiter=.ndone+n,
+      cooling.fn=cooling.fn,
+      rw.sd=rw.sd,
+      tol=tol,
+      check.fail = check.fail,
+      max.fail=max.fail,
+      verbose=verbose,
+      .indices=.indices,
+      .gnsi=gnsi,
+      tolerance = tolerance
+    )
+    
+    gnsi <- FALSE
+    
+    paramMatrix <- pfp@paramMatrix
+    traces[n+1,-c(1L,2L)] <- coef(pfp)
+    traces[n,1L] <- pfp@loglik
+    traces[n,2L] <- pfp@nfail
+    .indices <- pfp@indices
+    
+    if (verbose) cat("mif2 EnKF iteration",n,"of",Nmif,"completed\n")
+    
+  }
+  pfp@paramMatrix <- partrans(object,paramMatrix,dir="fromEst",.gnsi=gnsi)
+  new(
+    "mif2d_pomp",
+    pfp,
+    Nmif=Nmif,
+    rw.sd=rw.sd,
+    cooling.type=cooling.type,
+    cooling.fraction.50=cooling.fraction.50,
+    traces=traces
+  )}
+
+```
+
+# Bibliography
+
